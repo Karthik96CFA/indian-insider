@@ -68,6 +68,7 @@ PHASES: dict[str, list[Step]] = {
     ],
     "briefing": [
         Step("daily_briefing.py", "Morning briefing"),
+        Step("stocklens_bridge.py", "StockLens opportunity sync", required=False),
     ],
     "portfolio": [
         Step("dekisugi.py", "Dekisugi portfolio drift", required=False),

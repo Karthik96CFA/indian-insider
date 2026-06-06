@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from common import log, mark_dispatched, pending_consensus, render_consensus, send_email, send_telegram
+from stocklens_bridge import push_consensus
 
 
 def main() -> int:
@@ -27,7 +28,17 @@ def main() -> int:
         
         email_ok = False
         telegram_ok = False
-        
+        stocklens_ok = False
+
+        # StockLens signal queue (primary product UI)
+        try:
+            stocklens_ok = push_consensus(ev, row_id)
+            if stocklens_ok:
+                log("gian", f"stocklens pushed for [{row_id}] {ev.ticker}")
+        except Exception as exc:
+            log("gian", f"stocklens FAILED for [{row_id}]: {exc}")
+            print(f"[gian] stocklens FAILED for {ev.ticker}: {exc}")
+
         # Try Email
         try:
             send_email(subject, body)
@@ -46,10 +57,17 @@ def main() -> int:
             log("gian", f"telegram FAILED for [{row_id}]: {exc}")
             print(f"[gian] telegram FAILED for {ev.ticker}: {exc}")
             
-        if email_ok or telegram_ok:
+        if email_ok or telegram_ok or stocklens_ok:
             mark_dispatched(row_id)
             delivered += 1
-            print(f"[gian] dispatched {ev.direction} {ev.ticker}")
+            channels = []
+            if stocklens_ok:
+                channels.append("stocklens")
+            if email_ok:
+                channels.append("email")
+            if telegram_ok:
+                channels.append("telegram")
+            print(f"[gian] dispatched {ev.direction} {ev.ticker} via {', '.join(channels)}")
 
     log("gian", f"delivered {delivered}/{len(pending)} pending events")
     return 0
