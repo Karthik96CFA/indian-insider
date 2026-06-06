@@ -1,22 +1,23 @@
-From 08bfa96cc51a26429a74b9d3a64179ea2fa35ba0 Mon Sep 17 00:00:00 2001
+From c3eb1df331ea355a5efdf45de0881c183fa65ee1 Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Sat, 6 Jun 2026 22:59:34 +0000
-Subject: [PATCH] fix: remove full-page watermark, show Ex Libris logo
- top-right
+Subject: [PATCH] fix: remove full-page watermark, Ex Libris stamp top-right
+ only
 
-Remove the full-viewport background watermark (CSS opacity, filters,
-and checkerboard-prone background-image). Show the original
-ex-libris-watermark.png unchanged in the top-right: in TopHeader on
-dashboard pages and fixed top-right on login/signup.
+Drop the full-viewport background watermark (CSS background-image,
+opacity, filters). Show the original ex-libris-watermark.png as a
+small corner stamp: below the header on dashboard, top-right on auth.
+Remove from header bar so it does not crowd sign out. Move toasts to
+bottom-right to avoid overlap.
 ---
  src/app/(auth)/login/page.tsx            |  2 +
  src/app/(auth)/signup/page.tsx           |  2 +
+ src/app/(dashboard)/layout.tsx           |  2 +
  src/app/globals.css                      | 52 ------------------------
- src/app/layout.tsx                       |  2 -
- src/components/layout/BrandLogo.tsx      | 21 ++++++++++
+ src/app/layout.tsx                       |  4 +-
+ src/components/layout/BrandLogo.tsx      | 23 +++++++++++
  src/components/layout/BrandWatermark.tsx |  4 --
- src/components/layout/TopHeader.tsx      |  2 +
- 7 files changed, 27 insertions(+), 58 deletions(-)
+ 7 files changed, 30 insertions(+), 59 deletions(-)
  create mode 100644 src/components/layout/BrandLogo.tsx
  delete mode 100644 src/components/layout/BrandWatermark.tsx
 
@@ -54,6 +55,24 @@ index 3d71978..dba130f 100644
        <div className="absolute inset-0 pointer-events-none">
          <div className="absolute top-1/4 left-1/2 -translate-x-1/2 w-[500px] h-[500px] rounded-full bg-[#8b5cf6]/10 blur-[100px]" />
          <div className="absolute bottom-0 left-0 w-[300px] h-[300px] rounded-full bg-[#3b82f6]/8 blur-[80px]" />
+diff --git a/src/app/(dashboard)/layout.tsx b/src/app/(dashboard)/layout.tsx
+index ee5a074..d4cea2a 100644
+--- a/src/app/(dashboard)/layout.tsx
++++ b/src/app/(dashboard)/layout.tsx
+@@ -1,4 +1,5 @@
+ import { redirect } from 'next/navigation'
++import { BrandLogo } from '@/components/layout/BrandLogo'
+ import { Sidebar }   from '@/components/layout/Sidebar'
+ import { BottomNav } from '@/components/layout/BottomNav'
+ import { TopHeader } from '@/components/layout/TopHeader'
+@@ -28,6 +29,7 @@ export default async function DashboardLayout({
+         <Sidebar userEmail={user.email ?? ''} isInvestor={isInvestor} />
+ 
+         <div className="flex-1 flex flex-col min-h-screen">
++          <BrandLogo className="pointer-events-none fixed top-[4.25rem] right-4 z-20 select-none" />
+           <TopHeader userEmail={user.email ?? ''} />
+ 
+           <main className="flex-1 p-4 md:p-6 pb-20 md:pb-6">
 diff --git a/src/app/globals.css b/src/app/globals.css
 index 74327be..44ad22a 100644
 --- a/src/app/globals.css
@@ -118,7 +137,7 @@ index 74327be..44ad22a 100644
  
    .glass-panel {
 diff --git a/src/app/layout.tsx b/src/app/layout.tsx
-index 56e524c..7ad24eb 100644
+index 56e524c..b0fd92b 100644
 --- a/src/app/layout.tsx
 +++ b/src/app/layout.tsx
 @@ -2,7 +2,6 @@ import type { Metadata } from 'next'
@@ -129,7 +148,7 @@ index 56e524c..7ad24eb 100644
  import './globals.css'
  
  const dmSans = DM_Sans({
-@@ -33,7 +32,6 @@ export default function RootLayout({
+@@ -33,11 +32,10 @@ export default function RootLayout({
    return (
      <html lang="en" className={`dark ${dmSans.variable} ${dmMono.variable}`}>
        <body className="font-sans antialiased bg-[#080b0f] text-[#f1f5f9]">
@@ -137,20 +156,27 @@ index 56e524c..7ad24eb 100644
          <QueryProvider>
            <div className="relative z-[1] min-h-screen">{children}</div>
            <Toaster
+-            position="top-right"
++            position="bottom-right"
+             toastOptions={{
+               style: {
+                 background: 'rgba(12, 16, 24, 0.95)',
 diff --git a/src/components/layout/BrandLogo.tsx b/src/components/layout/BrandLogo.tsx
 new file mode 100644
-index 0000000..8089339
+index 0000000..cd18368
 --- /dev/null
 +++ b/src/components/layout/BrandLogo.tsx
-@@ -0,0 +1,21 @@
+@@ -0,0 +1,23 @@
 +import Image from 'next/image'
 +
 +interface BrandLogoProps {
 +  className?: string
 +}
 +
-+/** Ex Libris stamp — original PNG, no filters or opacity tricks. */
-+export function BrandLogo({ className = 'fixed top-4 right-4 z-30 pointer-events-none' }: BrandLogoProps) {
++/** Ex Libris stamp — original PNG, corner placement only (never full-page). */
++export function BrandLogo({
++  className = 'pointer-events-none fixed top-4 right-4 z-20 select-none',
++}: BrandLogoProps) {
 +  return (
 +    <div className={className} aria-hidden="true">
 +      <Image
@@ -158,7 +184,7 @@ index 0000000..8089339
 +        alt=""
 +        width={780}
 +        height={520}
-+        className="h-auto w-auto max-h-14 md:max-h-16"
++        className="h-9 w-auto sm:h-10"
 +        priority={false}
 +      />
 +    </div>
@@ -174,26 +200,6 @@ index bc232da..0000000
 -export function BrandWatermark() {
 -  return <div className="brand-watermark" aria-hidden="true" />
 -}
-diff --git a/src/components/layout/TopHeader.tsx b/src/components/layout/TopHeader.tsx
-index 16d99cd..5806480 100644
---- a/src/components/layout/TopHeader.tsx
-+++ b/src/components/layout/TopHeader.tsx
-@@ -2,6 +2,7 @@
- 
- import { LogOut, Command } from 'lucide-react'
- import { toast } from 'sonner'
-+import { BrandLogo } from '@/components/layout/BrandLogo'
- import { logoutAction } from '@/features/auth/actions'
- 
- interface TopHeaderProps {
-@@ -46,6 +47,7 @@ export function TopHeader({ userEmail }: TopHeaderProps) {
-           <LogOut size={15} />
-           <span className="hidden sm:block">Sign out</span>
-         </button>
-+        <BrandLogo className="shrink-0 pointer-events-none" />
-       </div>
-     </header>
-   )
 -- 
 2.43.0
 
