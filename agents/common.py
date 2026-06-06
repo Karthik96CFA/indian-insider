@@ -834,10 +834,12 @@ def _gemini_with_retry(client, prompt: str, config, max_retries: int = 3):
                 config=config,
             )
         except Exception as exc:
+            err = str(exc).lower()
             if attempt < max_retries - 1 and (
-                "429" in str(exc) or "quota" in str(exc).lower() or "limit" in str(exc).lower()
+                "429" in str(exc) or "503" in str(exc) or "unavailable" in err
+                or "quota" in err or "limit" in err
             ):
-                sys.stderr.write(f"[gemini] Rate limit hit, retrying in {delay}s (attempt {attempt + 1}/{max_retries})…\n")
+                sys.stderr.write(f"[gemini] Transient API error, retrying in {delay}s (attempt {attempt + 1}/{max_retries})…\n")
                 time.sleep(delay)
                 delay *= 2
             else:
