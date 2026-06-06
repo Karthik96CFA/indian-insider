@@ -1,6 +1,8 @@
 $ErrorActionPreference="Stop"
-$Root="$env:USERPROFILE\indian-insider"; $Agents="$Root\agents"
-$Logs="$Root\.state\logs"; $Folder="\IndianInsider"
+$Root="$env:USERPROFILE\indian-insider"
+$Agents="$Root\agents"
+$Logs="$Root\.state\logs"
+$Folder="\IndianInsider"
 $PythonCmd = Get-Command python -EA SilentlyContinue
 if ($PythonCmd) { $Python = $PythonCmd.Source } else { $Python = $null }
 if (-not $Python) {
@@ -9,17 +11,22 @@ if (-not $Python) {
 }
 if(-not $Python){Write-Error "Python not found."; exit 1}
 New-Item -ItemType Directory -Force -Path $Logs|Out-Null
-function RT{param($N,$S,$T)
+
+function RT{param($N,$Phase,$T)
   $p="$Folder\"; $n="Indian-$N"
   if(Get-ScheduledTask -TaskName $n -TaskPath $p -EA SilentlyContinue){Unregister-ScheduledTask -TaskName $n -TaskPath $p -Confirm:$false}
-  $a=New-ScheduledTaskAction -Execute $Python -Argument "`"$Agents\$S`"" -WorkingDirectory $Root
-  $st=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit(New-TimeSpan -Minutes 30)
-  Register-ScheduledTask -TaskName $n -TaskPath $p -Action $a -Trigger $T -Settings $st -Description "Indian Insider $N"|Out-Null
+  $a=New-ScheduledTaskAction -Execute $Python -Argument "`"$Agents\orchestrator.py`" --phase $Phase --continue-on-error" -WorkingDirectory $Root
+  $st=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit(New-TimeSpan -Hours 2)
+  Register-ScheduledTask -TaskName $n -TaskPath $p -Action $a -Trigger $T -Settings $st -Description "Indian Insider $N ($Phase)"|Out-Null
   Write-Host "  OK $p$n"
 }
-Write-Host "Registering pipeline agents..."
-RT "collector" "nse_collector.py" (New-ScheduledTaskTrigger -Once -At(Get-Date) -RepetitionInterval(New-TimeSpan -Minutes 30))
-RT "detector"  "event_detector.py" (New-ScheduledTaskTrigger -Once -At((Get-Date).AddMinutes(2)) -RepetitionInterval(New-TimeSpan -Minutes 30))
-RT "scorer"    "scoring_engine.py" (New-ScheduledTaskTrigger -Once -At((Get-Date).AddMinutes(4)) -RepetitionInterval(New-TimeSpan -Minutes 30))
-RT "gian"      "gian.py"           (New-ScheduledTaskTrigger -Once -At((Get-Date).AddMinutes(6)) -RepetitionInterval(New-TimeSpan -Minutes 30))
-Write-Host "`nAll pipeline agents registered. Logs -> $Logs"
+
+Write-Host "Registering Indian Insider automation..."
+RT "tick"      "tick"      (New-ScheduledTaskTrigger -Once -At(Get-Date) -RepetitionInterval(New-TimeSpan -Minutes 30))
+RT "morning"   "morning"   (New-ScheduledTaskTrigger -Weekly -DaysOfWeek Monday,Tuesday,Wednesday,Thursday,Friday -At "02:00")
+RT "briefing"  "briefing"  (New-ScheduledTaskTrigger -Weekly -DaysOfWeek Monday,Tuesday,Wednesday,Thursday,Friday -At "02:30")
+RT "portfolio" "portfolio" (New-ScheduledTaskTrigger -Weekly -DaysOfWeek Monday,Tuesday,Wednesday,Thursday,Friday -At "10:30")
+RT "eod"       "eod"       (New-ScheduledTaskTrigger -Weekly -DaysOfWeek Monday,Tuesday,Wednesday,Thursday,Friday -At "12:30")
+RT "weekly"    "weekly"    (New-ScheduledTaskTrigger -Weekly -DaysOfWeek Monday -At "03:30")
+RT "research"  "research"  (New-ScheduledTaskTrigger -Weekly -DaysOfWeek Sunday -At "00:30")
+Write-Host "`nAll automation phases registered. Logs -> $Logs"

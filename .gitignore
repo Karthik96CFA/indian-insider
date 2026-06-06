@@ -3,6 +3,7 @@
 *.db
 *.json
 !.env.example
+!config/.env.example
 !config/*.example.json
 !config/portfolio_current.json
 !config/portfolio_target.json
