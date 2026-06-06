@@ -34,7 +34,7 @@ try {
     New-Item -ItemType Directory -Force -Path $Engine | Out-Null
 
     Write-Host "==> Copying engine files from indian-insider"
-    robocopy $InsiderPath $Engine /E /XD .git .state __pycache__ /XF .env /NFL /NDL /NJH /NJS /nc /ns /np | Out-Null
+    robocopy $InsiderPath $Engine /E /XD .git .state __pycache__ scratch install\stocklens-overlay /XF .env entire_codebase_report.md test_concall.txt merge_into_stocklens.ps1 /NFL /NDL /NJH /NJS /nc /ns /np | Out-Null
     if ($LASTEXITCODE -ge 8) { throw "robocopy failed with exit $LASTEXITCODE" }
 
     Write-Host "==> Applying monorepo overlay"
