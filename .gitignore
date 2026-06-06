@@ -1,0 +1,26 @@
+# Database and local state caches
+.state/
+*.db
+*.json
+!.env.example
+!config/*.example.json
+!config/portfolio_current.json
+!config/portfolio_target.json
+
+# Environment variables
+.env
+.env.*
+
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# System files
+Thumbs.db
+Desktop.ini
+
+# Logs
+*.log

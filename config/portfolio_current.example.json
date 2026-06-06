@@ -1,0 +1,13 @@
+{
+  "_comment": "Fallback values in INR — used only if Angel One SmartAPI is unavailable.",
+  "RELIANCE":   75000.0,
+  "HDFCBANK":   68000.0,
+  "INFY":       52000.0,
+  "TCS":        48000.0,
+  "AXISBANK":   53000.0,
+  "ICICIBANK":  51000.0,
+  "SBIN":       24000.0,
+  "BAJFINANCE": 26000.0,
+  "NIFTYBEES":  49000.0,
+  "GOLDBEES":   54000.0
+}

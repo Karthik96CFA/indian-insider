@@ -1,0 +1,13 @@
+{
+  "_comment": "Target allocation as % of total portfolio. Must sum to 100.",
+  "RELIANCE":   15.0,
+  "HDFCBANK":   15.0,
+  "INFY":       10.0,
+  "TCS":        10.0,
+  "AXISBANK":   10.0,
+  "ICICIBANK":  10.0,
+  "SBIN":        5.0,
+  "BAJFINANCE":  5.0,
+  "NIFTYBEES":  10.0,
+  "GOLDBEES":   10.0
+}
