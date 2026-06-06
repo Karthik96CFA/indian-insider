@@ -1,5 +1,5 @@
 # Merge indian-insider into a local stocklens clone as engine/
-# Usage (from anywhere):
+# Usage:
 #   powershell -ExecutionPolicy Bypass -File C:\Users\karth\indian-insider\install\merge_into_stocklens.ps1
 param(
     [string]$StocklensPath = "C:\Users\karth\stocklens",
@@ -17,9 +17,9 @@ if (-not (Test-Path $StocklensPath)) { throw "StockLens not found: $StocklensPat
 if (-not (Test-Path (Join-Path $StocklensPath ".git"))) { throw "Not a git repo: $StocklensPath" }
 
 Write-Host "==> Indian Insider -> StockLens monorepo merge"
-Write-Host "    Insider:  $InsiderPath"
+Write-Host "    Insider:   $InsiderPath"
 Write-Host "    StockLens: $StocklensPath"
-Write-Host "    Branch:   $Branch"
+Write-Host "    Branch:    $Branch"
 
 Push-Location $StocklensPath
 try {
@@ -54,48 +54,26 @@ try {
     }
 
     $deploy = Join-Path $StocklensPath "DEPLOYMENT.md"
-    $deployText = Get-Content $deploy -Raw
+    $deployText = Get-Content $deploy -Raw -Encoding UTF8
     if ($deployText -notmatch 'INTEGRATION_SECRET') {
-        $deployText = $deployText -replace '(\| `CRON_SECRET` \|[^\n]+\n)', "`$1| ``INTEGRATION_SECRET`` | *(Optional)* Shared secret for the engine HTTP bridge. Set same value as ``STOCKLENS_INTEGRATION_SECRET`` in ``engine/.env``. | ``random-32-char-string`` |`n"
-        $engineBlock = @'
-
----
-
-## 🤖 Indian Insider Engine (PC)
-
-The Python market-intelligence engine lives in `engine/` and runs on **your PC** (not Railway). It pushes signals into StockLens via `POST /api/integrations/signals`.
-
-### Setup on Windows
-
-```powershell
-git clone https://github.com/Karthik96CFA/stocklens.git
-cd stocklens
-powershell -ExecutionPolicy Bypass -File engine\install\setup_windows.ps1
-notepad engine\.env
-python engine\agents\stocklens_bridge.py --test
-```
-
-### Engine environment (`engine/.env`)
-
-| Variable | Purpose |
-| :--- | :--- |
-| `GEMINI_API_KEY` | Google AI Studio key for scout agents |
-| `GMAIL_USER` / `GMAIL_APP_PASSWORD` / `GMAIL_TO` | Email alerts (use a Google **App Password**) |
-| `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | Optional Telegram delivery |
-| `STOCKLENS_URL` | Your Railway app URL |
-| `STOCKLENS_INTEGRATION_SECRET` | Must match Railway `INTEGRATION_SECRET` when set |
-
-Signals appear in **Alerts → Signal queue** in the web app.
-
-'@
-        $deployText = $deployText -replace '(\r?\n---\r?\n\r?\n## 🔒 GitHub Actions Secrets)', "$engineBlock`$1"
-        Set-Content $deploy -Value $deployText -Encoding UTF8 -NoNewline
+        $integrationRow = "| ``INTEGRATION_SECRET`` | *(Optional)* Shared secret for the engine HTTP bridge. Set same value as ``STOCKLENS_INTEGRATION_SECRET`` in ``engine/.env``. | ``random-32-char-string`` |`r`n"
+        $deployText = [regex]::Replace($deployText, '(\| ``CRON_SECRET`` \|[^\r\n]+\r?\n)', "`${1}$integrationRow", 1)
     }
+    if ($deployText -notmatch 'Indian Insider Engine') {
+        $engineBlock = Get-Content (Join-Path $OverlayRoot "DEPLOYMENT-engine-section.md") -Raw -Encoding UTF8
+        $deployText = [regex]::Replace(
+            $deployText,
+            '(\r?\n---\r?\n\r?\n## [^\r\n]*GitHub Actions Secrets)',
+            "$engineBlock`$1",
+            1
+        )
+    }
+    Set-Content $deploy -Value $deployText -Encoding UTF8 -NoNewline
 
     git add engine/ README.md .gitignore package.json DEPLOYMENT.md src/app/api/integrations/signals/route.ts
     $status = git status --porcelain
     if (-not $status) {
-        Write-Host "==> No changes — merge may already be applied."
+        Write-Host "==> No changes - merge may already be applied."
     } else {
         git commit -m "Merge Indian Insider engine into monorepo"
         Write-Host "==> Committed. Push with:"
