@@ -273,6 +273,10 @@ def main() -> int:
             "cooldown_minutes": 60,
             "ttl_days": 1,
         })
+        if ok:
+            print("[stocklens] test signal sent OK — check StockLens → Alerts → Signal queue")
+        else:
+            print("[stocklens] test signal FAILED — check STOCKLENS_URL and Railway app")
         return 0 if ok else 1
 
     if args.push_pending:
