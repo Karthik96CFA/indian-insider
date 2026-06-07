@@ -1,0 +1,576 @@
+From 2f057b06598d8798b91946f49b8ebfa0f94b5226 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Sun, 7 Jun 2026 04:28:28 +0000
+Subject: [PATCH] =?UTF-8?q?feat:=20admin=20Users=20page=20=E2=80=94=20invi?=
+ =?UTF-8?q?te=20and=20manage=20view-only=20accounts?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- /admin/users page (admin-only) lists Supabase users with roles
+- Invite, resend invite, and remove users via service role
+- Sidebar Users link and command palette entry for admins
+- ensureUserProfile on login creates view-only user_settings row
+---
+ src/app/(dashboard)/admin/users/page.tsx     |  34 ++++
+ src/app/(dashboard)/layout.tsx               |   3 +-
+ src/components/admin/UsersClient.tsx         | 197 +++++++++++++++++++
+ src/components/layout/CommandPalette.tsx     |  16 +-
+ src/components/layout/Sidebar.tsx            |   2 +
+ src/features/admin/userActions.ts            | 120 +++++++++++
+ src/features/pool/investorActions.ts         |   5 +-
+ src/lib/siteUrl.ts                           |   6 +
+ src/server/auth/appAccess.ts                 |   8 +
+ src/server/repositories/appUserRepository.ts |  48 +++++
+ 10 files changed, 430 insertions(+), 9 deletions(-)
+ create mode 100644 src/app/(dashboard)/admin/users/page.tsx
+ create mode 100644 src/components/admin/UsersClient.tsx
+ create mode 100644 src/features/admin/userActions.ts
+ create mode 100644 src/lib/siteUrl.ts
+ create mode 100644 src/server/repositories/appUserRepository.ts
+
+diff --git a/src/app/(dashboard)/admin/users/page.tsx b/src/app/(dashboard)/admin/users/page.tsx
+new file mode 100644
+index 0000000..af79ca7
+--- /dev/null
++++ b/src/app/(dashboard)/admin/users/page.tsx
+@@ -0,0 +1,34 @@
++import { redirect } from 'next/navigation'
++import { UsersClient } from '@/components/admin/UsersClient'
++import { getIsAdmin } from '@/server/auth/appAccess'
++import { listAppUsers } from '@/server/repositories/appUserRepository'
++import { getAuthenticatedUserId } from '@/server/db/supabase'
++
++export const metadata = { title: 'Users | StockLens Admin' }
++
++export default async function AdminUsersPage() {
++  const isAdmin = await getIsAdmin()
++  if (!isAdmin) redirect('/')
++
++  const [currentUserId, users] = await Promise.all([
++    getAuthenticatedUserId(),
++    listAppUsers().catch(() => []),
++  ])
++
++  return (
++    <div className="space-y-6 animate-fade-in">
++      <div className="page-header">
++        <div className="flex items-center gap-2 mb-1">
++          <span className="badge-pill">Admin</span>
++        </div>
++        <h1 className="page-title">Users</h1>
++        <p className="page-subtitle max-w-2xl mt-2 text-[13px] leading-relaxed">
++          Invite family or collaborators with view-only access. They see the same portfolio and pool data as you
++          but cannot edit holdings, sync broker data, or change settings beyond their own Telegram alerts.
++        </p>
++      </div>
++
++      <UsersClient users={users} currentUserId={currentUserId} />
++    </div>
++  )
++}
+diff --git a/src/app/(dashboard)/layout.tsx b/src/app/(dashboard)/layout.tsx
+index 5b789ac..47d7ae4 100644
+--- a/src/app/(dashboard)/layout.tsx
++++ b/src/app/(dashboard)/layout.tsx
+@@ -7,7 +7,7 @@ import { CommandPalette } from '@/components/layout/CommandPalette'
+ import { AppAccessProvider } from '@/components/layout/AppAccessContext'
+ import { ReadOnlyBanner } from '@/components/layout/ReadOnlyBanner'
+ import { activateInvestorOnLogin } from '@/server/auth/poolAccess'
+-import { ensureAdminOnLogin, getIsAdmin } from '@/server/auth/appAccess'
++import { ensureAdminOnLogin, ensureUserProfile, getIsAdmin } from '@/server/auth/appAccess'
+ import { createSupabaseServerClient } from '@/server/db/supabase'
+ 
+ export default async function DashboardLayout({
+@@ -21,6 +21,7 @@ export default async function DashboardLayout({
+   if (!user) redirect('/login')
+ 
+   await activateInvestorOnLogin(user.id, user.email ?? '')
++  await ensureUserProfile(user.id)
+   await ensureAdminOnLogin(user.id, user.email ?? '')
+   const isAdmin = await getIsAdmin()
+ 
+diff --git a/src/components/admin/UsersClient.tsx b/src/components/admin/UsersClient.tsx
+new file mode 100644
+index 0000000..feed8b1
+--- /dev/null
++++ b/src/components/admin/UsersClient.tsx
+@@ -0,0 +1,197 @@
++'use client'
++
++import { useState, useTransition } from 'react'
++import { useRouter } from 'next/navigation'
++import { toast } from 'sonner'
++import { Loader2, Mail, UserPlus, UserX, RefreshCw, Shield, Eye } from 'lucide-react'
++import {
++  inviteAppUserAction,
++  removeAppUserAction,
++  resendInviteAction,
++} from '@/features/admin/userActions'
++import type { AppUserRow } from '@/server/repositories/appUserRepository'
++
++interface Props {
++  users: AppUserRow[]
++  currentUserId: string
++}
++
++function formatWhen(iso: string | null): string {
++  if (!iso) return '—'
++  return new Date(iso).toLocaleString('en-IN', {
++    day: 'numeric',
++    month: 'short',
++    year: '2-digit',
++    hour: '2-digit',
++    minute: '2-digit',
++  })
++}
++
++export function UsersClient({ users, currentUserId }: Props) {
++  const router = useRouter()
++  const [isPending, startTransition] = useTransition()
++  const [email, setEmail] = useState('')
++
++  function handleInvite() {
++    startTransition(async () => {
++      const result = await inviteAppUserAction(email)
++      if (!result.success) {
++        toast.error(result.error ?? 'Invite failed')
++        return
++      }
++      toast.success(`Invite sent to ${email.trim()}`)
++      setEmail('')
++      router.refresh()
++    })
++  }
++
++  function handleResend(targetEmail: string) {
++    startTransition(async () => {
++      const result = await resendInviteAction(targetEmail)
++      if (!result.success) {
++        toast.error(result.error ?? 'Resend failed')
++        return
++      }
++      toast.success(`Invite resent to ${targetEmail}`)
++      router.refresh()
++    })
++  }
++
++  function handleRemove(user: AppUserRow) {
++    if (!window.confirm(`Remove ${user.email}? They will lose access immediately.`)) return
++
++    startTransition(async () => {
++      const result = await removeAppUserAction(user.id)
++      if (!result.success) {
++        toast.error(result.error ?? 'Remove failed')
++        return
++      }
++      toast.success(`${user.email} removed`)
++      router.refresh()
++    })
++  }
++
++  return (
++    <div className="space-y-6 max-w-3xl">
++      <div className="card rounded-xl p-5 border border-[#1c212a] bg-[#0b0e14]">
++        <div className="flex items-center gap-2 mb-2">
++          <UserPlus size={16} className="text-[#60a5fa]" />
++          <h2 className="text-sm font-semibold text-[#f1f5f9]">Invite user</h2>
++        </div>
++        <p className="text-xs text-[#64748b] mb-4 leading-relaxed">
++          Sends a Supabase invite email. New users get <strong className="text-[#94a3b8]">view-only</strong> access
++          to the full app (same screens as you, no edits).
++        </p>
++        <div className="flex flex-col sm:flex-row gap-2">
++          <input
++            type="email"
++            value={email}
++            onChange={(e) => setEmail(e.target.value)}
++            placeholder="family@example.com"
++            className="flex-1 bg-[#070a0d] border border-[#1c212a] rounded-lg px-3 py-2 text-sm text-[#e2e8f0]"
++          />
++          <button
++            type="button"
++            onClick={handleInvite}
++            disabled={isPending || !email.trim()}
++            className="btn-primary py-2 px-4 text-sm justify-center shrink-0"
++          >
++            {isPending ? <Loader2 size={14} className="animate-spin" /> : <Mail size={14} />}
++            Send invite
++          </button>
++        </div>
++      </div>
++
++      <div className="card rounded-xl border border-[#1c212a] bg-[#0b0e14] overflow-hidden">
++        <div className="px-5 py-3 border-b border-[#1c212a]">
++          <h2 className="text-sm font-semibold text-[#f1f5f9]">
++            Users ({users.length})
++          </h2>
++        </div>
++
++        {users.length === 0 ? (
++          <p className="px-5 py-8 text-sm text-[#64748b] text-center">No users yet.</p>
++        ) : (
++          <div className="divide-y divide-[#1c212a]/60">
++            {users.map((user) => {
++              const isSelf = user.id === currentUserId
++              const status = user.emailConfirmed
++                ? user.lastSignInAt
++                  ? 'Active'
++                  : 'Confirmed'
++                : 'Invite pending'
++
++              return (
++                <div
++                  key={user.id}
++                  className="px-5 py-3 flex flex-col sm:flex-row sm:items-center gap-3 justify-between"
++                >
++                  <div className="min-w-0">
++                    <div className="flex items-center gap-2 flex-wrap">
++                      <span className="text-sm font-medium text-[#e2e8f0] truncate">{user.email}</span>
++                      {isSelf && (
++                        <span className="text-[9px] uppercase font-bold px-1.5 py-0.5 rounded bg-[#3b82f6]/15 text-[#60a5fa]">
++                          You
++                        </span>
++                      )}
++                      <span
++                        className={`inline-flex items-center gap-1 text-[9px] uppercase font-bold px-1.5 py-0.5 rounded ${
++                          user.isAdmin
++                            ? 'bg-[#22c55e]/15 text-[#22c55e]'
++                            : 'bg-[#64748b]/15 text-[#94a3b8]'
++                        }`}
++                      >
++                        {user.isAdmin ? <Shield size={10} /> : <Eye size={10} />}
++                        {user.isAdmin ? 'Admin' : 'View only'}
++                      </span>
++                      <span
++                        className={`text-[9px] uppercase font-bold px-1.5 py-0.5 rounded ${
++                          status === 'Active'
++                            ? 'bg-[#22c55e]/10 text-[#22c55e]'
++                            : status === 'Invite pending'
++                              ? 'bg-[#f59e0b]/10 text-[#fbbf24]'
++                              : 'bg-[#3b82f6]/10 text-[#60a5fa]'
++                        }`}
++                      >
++                        {status}
++                      </span>
++                    </div>
++                    <p className="text-[10px] text-[#64748b] mt-1 font-mono">
++                      Joined {formatWhen(user.createdAt)}
++                      {user.lastSignInAt ? ` · Last sign-in ${formatWhen(user.lastSignInAt)}` : ''}
++                    </p>
++                  </div>
++
++                  {!isSelf && (
++                    <div className="flex items-center gap-2 shrink-0">
++                      {!user.emailConfirmed && (
++                        <button
++                          type="button"
++                          disabled={isPending}
++                          onClick={() => handleResend(user.email)}
++                          className="px-2.5 py-1.5 rounded border border-[#1c212a] text-[10px] text-[#94a3b8] hover:text-[#e2e8f0] flex items-center gap-1"
++                        >
++                          <RefreshCw size={11} />
++                          Resend
++                        </button>
++                      )}
++                      <button
++                        type="button"
++                        disabled={isPending}
++                        onClick={() => handleRemove(user)}
++                        className="px-2.5 py-1.5 rounded border border-[#ef4444]/30 text-[10px] text-[#ef4444] hover:bg-[#ef4444]/10 flex items-center gap-1"
++                      >
++                        <UserX size={11} />
++                        Remove
++                      </button>
++                    </div>
++                  )}
++                </div>
++              )
++            })}
++          </div>
++        )}
++      </div>
++    </div>
++  )
++}
+diff --git a/src/components/layout/CommandPalette.tsx b/src/components/layout/CommandPalette.tsx
+index f30134f..c547c54 100644
+--- a/src/components/layout/CommandPalette.tsx
++++ b/src/components/layout/CommandPalette.tsx
+@@ -7,7 +7,7 @@ import { useAppAccess } from '@/components/layout/AppAccessContext'
+ import { COMMAND_ITEMS } from '@/lib/navigation'
+ 
+ export function CommandPalette() {
+-  const { isReadOnly } = useAppAccess()
++  const { isReadOnly, isAdmin } = useAppAccess()
+   const [isOpen, setIsOpen] = useState(false)
+   const [search, setSearch] = useState('')
+   const [activeIndex, setActiveIndex] = useState(0)
+@@ -15,9 +15,17 @@ export function CommandPalette() {
+   const overlayRef = useRef<HTMLDivElement>(null)
+   const inputRef = useRef<HTMLInputElement>(null)
+ 
+-  const commands = isReadOnly
+-    ? COMMAND_ITEMS.filter((cmd) => cmd.category === 'Navigation')
+-    : COMMAND_ITEMS
++  const commands = [
++    ...(isReadOnly ? COMMAND_ITEMS.filter((cmd) => cmd.category === 'Navigation') : COMMAND_ITEMS),
++    ...(isAdmin
++      ? [{
++          label: 'Users (Admin)',
++          description: 'Invite and manage view-only app users.',
++          category: 'Navigation' as const,
++          href: '/admin/users',
++        }]
++      : []),
++  ]
+ 
+   useEffect(() => {
+     const handleKeyDown = (e: KeyboardEvent) => {
+diff --git a/src/components/layout/Sidebar.tsx b/src/components/layout/Sidebar.tsx
+index 1c2d31e..7d10ddd 100644
+--- a/src/components/layout/Sidebar.tsx
++++ b/src/components/layout/Sidebar.tsx
+@@ -2,6 +2,7 @@
+ 
+ import Link from 'next/link'
+ import { usePathname } from 'next/navigation'
++import { Users } from 'lucide-react'
+ import { ADMIN_NAV } from '@/lib/navigation'
+ 
+ interface SidebarProps {
+@@ -70,6 +71,7 @@ export function Sidebar({ userEmail = 'karthik@stocklens.com', isAdmin = false }
+             System
+           </div>
+           <div className="space-y-0.5">
++            {isAdmin && renderLink('/admin/users', 'Users', 'Invite and manage view-only app users', Users)}
+             {renderLink(settingsItem.href, settingsItem.label, settingsItem.description, settingsItem.icon)}
+           </div>
+         </div>
+diff --git a/src/features/admin/userActions.ts b/src/features/admin/userActions.ts
+new file mode 100644
+index 0000000..f6b58c1
+--- /dev/null
++++ b/src/features/admin/userActions.ts
+@@ -0,0 +1,120 @@
++'use server'
++
++import { revalidatePath } from 'next/cache'
++import { writeAudit } from '@/lib/audit'
++import { siteUrl } from '@/lib/siteUrl'
++import { isUserAdmin, requireAdmin } from '@/server/auth/appAccess'
++import {
++  countAdmins,
++  deleteUserSettings,
++  listAppUsers,
++} from '@/server/repositories/appUserRepository'
++import { createSupabaseServiceClient, getAuthenticatedUserId } from '@/server/db/supabase'
++
++export async function getAppUsersAction(): Promise<{
++  success: boolean
++  users?: Awaited<ReturnType<typeof listAppUsers>>
++  error?: string
++}> {
++  try {
++    await requireAdmin()
++    const users = await listAppUsers()
++    return { success: true, users }
++  } catch (err) {
++    return { success: false, error: err instanceof Error ? err.message : 'Failed to load users' }
++  }
++}
++
++export async function inviteAppUserAction(
++  email: string,
++): Promise<{ success: boolean; error?: string }> {
++  try {
++    await requireAdmin()
++
++    const normalized = email.trim().toLowerCase()
++    if (!normalized || !normalized.includes('@')) {
++      return { success: false, error: 'Valid email is required' }
++    }
++
++    const existing = await listAppUsers()
++    if (existing.some((u) => u.email.toLowerCase() === normalized)) {
++      return { success: false, error: 'A user with this email already exists' }
++    }
++
++    const supabase = createSupabaseServiceClient()
++    const { error } = await supabase.auth.admin.inviteUserByEmail(normalized, {
++      redirectTo: `${siteUrl()}/auth/callback`,
++    })
++
++    if (error) {
++      return { success: false, error: error.message }
++    }
++
++    const actor = await getAuthenticatedUserId()
++    await writeAudit('manual_action', `Invited user ${normalized}`, { email: normalized }, actor)
++
++    revalidatePath('/admin/users')
++    return { success: true }
++  } catch (err) {
++    return { success: false, error: err instanceof Error ? err.message : 'Invite failed' }
++  }
++}
++
++export async function resendInviteAction(
++  email: string,
++): Promise<{ success: boolean; error?: string }> {
++  try {
++    await requireAdmin()
++
++    const normalized = email.trim().toLowerCase()
++    const supabase = createSupabaseServiceClient()
++    const { error } = await supabase.auth.admin.inviteUserByEmail(normalized, {
++      redirectTo: `${siteUrl()}/auth/callback`,
++    })
++
++    if (error) {
++      return { success: false, error: error.message }
++    }
++
++    revalidatePath('/admin/users')
++    return { success: true }
++  } catch (err) {
++    return { success: false, error: err instanceof Error ? err.message : 'Resend failed' }
++  }
++}
++
++export async function removeAppUserAction(
++  userId: string,
++): Promise<{ success: boolean; error?: string }> {
++  try {
++    await requireAdmin()
++
++    const currentId = await getAuthenticatedUserId()
++    if (userId === currentId) {
++      return { success: false, error: 'You cannot remove your own account' }
++    }
++
++    if (await isUserAdmin(userId)) {
++      const admins = await countAdmins()
++      if (admins <= 1) {
++        return { success: false, error: 'Cannot remove the only admin account' }
++      }
++    }
++
++    const supabase = createSupabaseServiceClient()
++    const { error } = await supabase.auth.admin.deleteUser(userId)
++    if (error) {
++      return { success: false, error: error.message }
++    }
++
++    await deleteUserSettings(userId)
++
++    const actor = await getAuthenticatedUserId()
++    await writeAudit('manual_action', `Removed user ${userId}`, { userId }, actor)
++
++    revalidatePath('/admin/users')
++    return { success: true }
++  } catch (err) {
++    return { success: false, error: err instanceof Error ? err.message : 'Remove failed' }
++  }
++}
+diff --git a/src/features/pool/investorActions.ts b/src/features/pool/investorActions.ts
+index f4a6d54..178e242 100644
+--- a/src/features/pool/investorActions.ts
++++ b/src/features/pool/investorActions.ts
+@@ -13,10 +13,7 @@ import {
+   voidPoolInvestorTransaction,
+ } from '@/server/repositories/poolInvestorRepository'
+ 
+-function siteUrl(): string {
+-  const domain = process.env.RAILWAY_PUBLIC_DOMAIN
+-  return domain ? `https://${domain}` : process.env.NEXT_PUBLIC_SITE_URL ?? 'http://localhost:3000'
+-}
++import { siteUrl } from '@/lib/siteUrl'
+ 
+ export async function invitePoolInvestorAction(
+   email: string,
+diff --git a/src/lib/siteUrl.ts b/src/lib/siteUrl.ts
+new file mode 100644
+index 0000000..0771ae0
+--- /dev/null
++++ b/src/lib/siteUrl.ts
+@@ -0,0 +1,6 @@
++/** Canonical app URL for auth redirects and invite emails. */
++export function siteUrl(): string {
++  const domain = process.env.RAILWAY_PUBLIC_DOMAIN
++  if (domain) return `https://${domain}`
++  return process.env.NEXT_PUBLIC_SITE_URL ?? 'http://localhost:3000'
++}
+diff --git a/src/server/auth/appAccess.ts b/src/server/auth/appAccess.ts
+index c4ce606..71fb947 100644
+--- a/src/server/auth/appAccess.ts
++++ b/src/server/auth/appAccess.ts
+@@ -69,3 +69,11 @@ export async function ensureAdminOnLogin(userId: string, email: string): Promise
+ export function isPublicSignupAllowed(): boolean {
+   return process.env.ALLOW_PUBLIC_SIGNUP === 'true'
+ }
++
++/** Ensure every signed-in user has a user_settings row (view-only by default). */
++export async function ensureUserProfile(userId: string): Promise<void> {
++  await db
++    .insert(userSettings)
++    .values({ user_id: userId, is_admin: false })
++    .onConflictDoNothing()
++}
+diff --git a/src/server/repositories/appUserRepository.ts b/src/server/repositories/appUserRepository.ts
+new file mode 100644
+index 0000000..94baf44
+--- /dev/null
++++ b/src/server/repositories/appUserRepository.ts
+@@ -0,0 +1,48 @@
++import 'server-only'
++
++import { eq } from 'drizzle-orm'
++import { db } from '@/server/db'
++import { userSettings } from '@/server/db/schema'
++import { createSupabaseServiceClient } from '@/server/db/supabase'
++
++export interface AppUserRow {
++  id: string
++  email: string
++  isAdmin: boolean
++  createdAt: string
++  lastSignInAt: string | null
++  emailConfirmed: boolean
++}
++
++export async function listAppUsers(): Promise<AppUserRow[]> {
++  const supabase = createSupabaseServiceClient()
++  const { data, error } = await supabase.auth.admin.listUsers({ page: 1, perPage: 200 })
++  if (error) throw new Error(error.message)
++
++  const settings = await db.select().from(userSettings)
++  const adminByUser = new Map(settings.map((s) => [s.user_id, s.is_admin]))
++
++  return (data.users ?? [])
++    .filter((u) => u.email)
++    .map((u) => ({
++      id:               u.id,
++      email:            u.email!,
++      isAdmin:          adminByUser.get(u.id) ?? false,
++      createdAt:        u.created_at,
++      lastSignInAt:     u.last_sign_in_at ?? null,
++      emailConfirmed:   Boolean(u.email_confirmed_at),
++    }))
++    .sort((a, b) => a.email.localeCompare(b.email))
++}
++
++export async function countAdmins(): Promise<number> {
++  const rows = await db
++    .select({ id: userSettings.id })
++    .from(userSettings)
++    .where(eq(userSettings.is_admin, true))
++  return rows.length
++}
++
++export async function deleteUserSettings(userId: string): Promise<void> {
++  await db.delete(userSettings).where(eq(userSettings.user_id, userId))
++}
+-- 
+2.43.0
+
