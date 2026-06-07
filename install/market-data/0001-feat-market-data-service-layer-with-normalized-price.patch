@@ -1,0 +1,1039 @@
+From 326410bc335b19e48ecfa055e42d5250a20c7f5a Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Sun, 7 Jun 2026 03:45:50 +0000
+Subject: [PATCH] feat: market data service layer with normalized prices
+
+Add instruments, normalized_prices, and normalized_corporate_actions
+tables. Route all price queries through marketDataService with provider
+fan-out (Angel > NSE > BSE > Yahoo), corporate action adjustment, and
+dual-write to legacy price_cache. Add market-data-sync cron workflow.
+---
+ .github/workflows/market-data-sync.yml        |  18 ++
+ drizzle/migrations/0012_market_data_layer.sql |  75 ++++++++
+ drizzle/migrations/meta/_journal.json         |   7 +
+ src/app/api/broker/prices/route.ts            |   4 +-
+ src/app/api/cron/market-data-sync/route.ts    |  56 ++++++
+ src/server/db/schema.ts                       |  90 ++++++++-
+ .../repositories/instrumentRepository.ts      |  79 ++++++++
+ .../repositories/marketDataRepository.ts      |  73 +++++++
+ src/services/brokers/broker.ts                |  24 +--
+ src/services/brokers/types.ts                 |   2 +-
+ .../marketData/corporateActions.test.ts       |  55 ++++++
+ src/services/marketData/corporateActions.ts   |  38 ++++
+ src/services/marketData/marketDataService.ts  | 180 ++++++++++++++++++
+ .../marketData/providers/angelProvider.ts     |  28 +++
+ .../marketData/providers/bseProvider.ts       |  15 ++
+ .../marketData/providers/nseProvider.ts       |  15 ++
+ .../marketData/providers/yahooProvider.ts     |  28 +++
+ src/services/marketData/types.ts              |  35 ++++
+ 18 files changed, 800 insertions(+), 22 deletions(-)
+ create mode 100644 .github/workflows/market-data-sync.yml
+ create mode 100644 drizzle/migrations/0012_market_data_layer.sql
+ create mode 100644 src/app/api/cron/market-data-sync/route.ts
+ create mode 100644 src/server/repositories/instrumentRepository.ts
+ create mode 100644 src/server/repositories/marketDataRepository.ts
+ create mode 100644 src/services/marketData/corporateActions.test.ts
+ create mode 100644 src/services/marketData/corporateActions.ts
+ create mode 100644 src/services/marketData/marketDataService.ts
+ create mode 100644 src/services/marketData/providers/angelProvider.ts
+ create mode 100644 src/services/marketData/providers/bseProvider.ts
+ create mode 100644 src/services/marketData/providers/nseProvider.ts
+ create mode 100644 src/services/marketData/providers/yahooProvider.ts
+ create mode 100644 src/services/marketData/types.ts
+
+diff --git a/.github/workflows/market-data-sync.yml b/.github/workflows/market-data-sync.yml
+new file mode 100644
+index 0000000..0877d1c
+--- /dev/null
++++ b/.github/workflows/market-data-sync.yml
+@@ -0,0 +1,18 @@
++name: Market Data Sync
++
++on:
++  schedule:
++    # Every 15 min during NSE session (09:00–15:45 IST ≈ 03:30–10:15 UTC)
++    - cron: '*/15 3-10 * * 1-5'
++  workflow_dispatch:
++
++jobs:
++  sync:
++    runs-on: ubuntu-latest
++    timeout-minutes: 10
++    steps:
++      - name: Sync normalized prices
++        run: |
++          curl -sf -X GET \
++            -H "X-Cron-Secret: ${{ secrets.CRON_SECRET }}" \
++            "${{ secrets.RAILWAY_APP_URL }}/api/cron/market-data-sync"
+diff --git a/drizzle/migrations/0012_market_data_layer.sql b/drizzle/migrations/0012_market_data_layer.sql
+new file mode 100644
+index 0000000..7cfc96e
+--- /dev/null
++++ b/drizzle/migrations/0012_market_data_layer.sql
+@@ -0,0 +1,75 @@
++-- Market data layer: canonical instruments, normalized prices, corporate actions
++
++DO $$ BEGIN
++  CREATE TYPE instrument_status AS ENUM ('active', 'suspended', 'delisted', 'symbol_changed');
++EXCEPTION WHEN duplicate_object THEN NULL;
++END $$;
++
++DO $$ BEGIN
++  CREATE TYPE corporate_action_type AS ENUM (
++    'split', 'bonus', 'dividend', 'symbol_change', 'delisting', 'rights', 'merger'
++  );
++EXCEPTION WHEN duplicate_object THEN NULL;
++END $$;
++
++DO $$ BEGIN
++  CREATE TYPE market_data_source AS ENUM ('angel_one', 'yahoo', 'nse', 'bse', 'aggregated');
++EXCEPTION WHEN duplicate_object THEN NULL;
++END $$;
++
++ALTER TYPE price_source ADD VALUE IF NOT EXISTS 'nse';
++ALTER TYPE price_source ADD VALUE IF NOT EXISTS 'bse';
++ALTER TYPE price_source ADD VALUE IF NOT EXISTS 'aggregated';
++
++CREATE TABLE IF NOT EXISTS instruments (
++  id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
++  canonical_symbol    TEXT NOT NULL,
++  exchange            TEXT NOT NULL DEFAULT 'NSE',
++  bse_scrip_code      TEXT,
++  angel_broker_symbol TEXT,
++  yahoo_symbol        TEXT,
++  company_name        TEXT,
++  status              instrument_status NOT NULL DEFAULT 'active',
++  superseded_by       UUID REFERENCES instruments(id) ON DELETE SET NULL,
++  created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
++  updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
++  CONSTRAINT instruments_symbol_exchange_uniq UNIQUE (canonical_symbol, exchange)
++);
++
++CREATE INDEX IF NOT EXISTS instruments_angel_broker_symbol_idx ON instruments (angel_broker_symbol);
++CREATE INDEX IF NOT EXISTS instruments_bse_scrip_code_idx ON instruments (bse_scrip_code);
++CREATE INDEX IF NOT EXISTS instruments_status_idx ON instruments (status);
++
++CREATE TABLE IF NOT EXISTS normalized_prices (
++  instrument_id   UUID PRIMARY KEY REFERENCES instruments(id) ON DELETE CASCADE,
++  price           NUMERIC(12, 4) NOT NULL,
++  change_pct      NUMERIC(8, 4) NOT NULL DEFAULT 0,
++  currency        TEXT NOT NULL DEFAULT 'INR',
++  source          market_data_source NOT NULL,
++  as_of           TIMESTAMPTZ NOT NULL,
++  fetched_at      TIMESTAMPTZ NOT NULL,
++  raw_price       NUMERIC(12, 4),
++  is_corp_adjusted BOOLEAN NOT NULL DEFAULT FALSE,
++  updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
++);
++
++CREATE INDEX IF NOT EXISTS normalized_prices_fetched_at_idx ON normalized_prices (fetched_at);
++
++CREATE TABLE IF NOT EXISTS normalized_corporate_actions (
++  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
++  instrument_id   UUID NOT NULL REFERENCES instruments(id) ON DELETE CASCADE,
++  action_type     corporate_action_type NOT NULL,
++  ex_date         DATE NOT NULL,
++  ratio_numerator   NUMERIC(12, 4),
++  ratio_denominator NUMERIC(12, 4),
++  old_symbol      TEXT,
++  new_symbol      TEXT,
++  source          TEXT NOT NULL DEFAULT 'manual',
++  notes           TEXT,
++  payload_json    JSONB,
++  created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
++  CONSTRAINT normalized_corp_actions_uniq UNIQUE (instrument_id, action_type, ex_date)
++);
++
++CREATE INDEX IF NOT EXISTS normalized_corp_actions_instrument_idx
++  ON normalized_corporate_actions (instrument_id, ex_date DESC);
+diff --git a/drizzle/migrations/meta/_journal.json b/drizzle/migrations/meta/_journal.json
+index 204e4ae..95b4e4e 100644
+--- a/drizzle/migrations/meta/_journal.json
++++ b/drizzle/migrations/meta/_journal.json
+@@ -85,6 +85,13 @@
+       "when": 1780800838201,
+       "tag": "0011_opportunity_scores_regime_state",
+       "breakpoints": true
++    },
++    {
++      "idx": 12,
++      "version": "7",
++      "when": 1780900838201,
++      "tag": "0012_market_data_layer",
++      "breakpoints": true
+     }
+   ]
+ }
+\ No newline at end of file
+diff --git a/src/app/api/broker/prices/route.ts b/src/app/api/broker/prices/route.ts
+index eb60767..398e7ee 100644
+--- a/src/app/api/broker/prices/route.ts
++++ b/src/app/api/broker/prices/route.ts
+@@ -11,7 +11,7 @@ const bodySchema = z.object({
+ export interface PriceResponse {
+   price:      number
+   change_pct: number
+-  source:     'angel_one' | 'yahoo'
++  source:     'angel_one' | 'yahoo' | 'nse' | 'bse' | 'aggregated'
+   fetched_at: string
+   stale_data: boolean
+ }
+@@ -35,7 +35,7 @@ export async function POST(request: NextRequest) {
+       ticker: string
+       price: string
+       change_pct: string
+-      source: 'angel_one' | 'yahoo'
++      source: 'angel_one' | 'yahoo' | 'nse' | 'bse' | 'aggregated'
+       fetched_at: Date
+     }> = []
+ 
+diff --git a/src/app/api/cron/market-data-sync/route.ts b/src/app/api/cron/market-data-sync/route.ts
+new file mode 100644
+index 0000000..9080ead
+--- /dev/null
++++ b/src/app/api/cron/market-data-sync/route.ts
+@@ -0,0 +1,56 @@
++import { NextResponse, type NextRequest } from 'next/server'
++import { env } from '@/lib/env'
++import { db } from '@/server/db'
++import { holdings } from '@/server/db/schema'
++import { eq } from 'drizzle-orm'
++import { syncMarketDataForTickers } from '@/services/marketData/marketDataService'
++
++const rateLimitMap = new Map<string, { count: number; windowStart: number }>()
++
++function isRateLimited(ip: string): boolean {
++  const now = Date.now()
++  const windowMs = 60 * 1000
++  const record = rateLimitMap.get(ip)
++
++  if (!record) {
++    rateLimitMap.set(ip, { count: 1, windowStart: now })
++    return false
++  }
++  if (now - record.windowStart > windowMs) {
++    rateLimitMap.set(ip, { count: 1, windowStart: now })
++    return false
++  }
++  record.count += 1
++  return record.count > 5
++}
++
++export async function GET(request: NextRequest) {
++  const ip = request.headers.get('x-forwarded-for') || '127.0.0.1'
++
++  if (isRateLimited(ip)) {
++    return NextResponse.json({ error: 'Too many requests' }, { status: 429 })
++  }
++
++  const cronSecretHeader = request.headers.get('x-cron-secret')
++  if (!cronSecretHeader || cronSecretHeader !== env.CRON_SECRET) {
++    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
++  }
++
++  try {
++    const rows = await db
++      .select({ ticker: holdings.ticker })
++      .from(holdings)
++      .where(eq(holdings.status, 'active'))
++
++    const tickers = Array.from(new Set(rows.map((r) => r.ticker)))
++    const result = await syncMarketDataForTickers(tickers)
++
++    return NextResponse.json({
++      tickers: tickers.length,
++      ...result,
++    })
++  } catch (error) {
++    console.error('[cron-market-data-sync]', error)
++    return NextResponse.json({ error: 'Internal Server Error' }, { status: 500 })
++  }
++}
+diff --git a/src/server/db/schema.ts b/src/server/db/schema.ts
+index 494e225..d47532a 100644
+--- a/src/server/db/schema.ts
++++ b/src/server/db/schema.ts
+@@ -11,6 +11,7 @@ import {
+   integer,
+   boolean,
+   timestamp,
++  date,
+   jsonb,
+   pgEnum,
+   index,
+@@ -22,7 +23,19 @@ import {
+ 
+ export const holdingStatusEnum = pgEnum('holding_status', ['active', 'exited'])
+ export const holdingSourceEnum = pgEnum('holding_source', ['manual', 'angel_one'])
+-export const priceSourceEnum   = pgEnum('price_source',   ['angel_one', 'yahoo'])
++export const priceSourceEnum   = pgEnum('price_source',   ['angel_one', 'yahoo', 'nse', 'bse', 'aggregated'])
++
++export const instrumentStatusEnum = pgEnum('instrument_status', [
++  'active', 'suspended', 'delisted', 'symbol_changed',
++])
++
++export const corporateActionTypeEnum = pgEnum('corporate_action_type', [
++  'split', 'bonus', 'dividend', 'symbol_change', 'delisting', 'rights', 'merger',
++])
++
++export const marketDataSourceEnum = pgEnum('market_data_source', [
++  'angel_one', 'yahoo', 'nse', 'bse', 'aggregated',
++])
+ 
+ // ─── Holdings ─────────────────────────────────────────────────────────────────
+ 
+@@ -127,7 +140,73 @@ export const alerts = pgTable(
+   })
+ )
+ 
+-// ─── Price Cache ──────────────────────────────────────────────────────────────
++// ─── Market Data Layer ───────────────────────────────────────────────────────
++
++export const instruments = pgTable(
++  'instruments',
++  {
++    id:                  uuid('id').defaultRandom().primaryKey(),
++    canonical_symbol:    text('canonical_symbol').notNull(),
++    exchange:            text('exchange').notNull().default('NSE'),
++    bse_scrip_code:      text('bse_scrip_code'),
++    angel_broker_symbol: text('angel_broker_symbol'),
++    yahoo_symbol:        text('yahoo_symbol'),
++    company_name:        text('company_name'),
++    status:              instrumentStatusEnum('status').notNull().default('active'),
++    superseded_by:       uuid('superseded_by'),
++    created_at:          timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
++    updated_at:          timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
++  },
++  (t) => ({
++    symbolExchangeUniq: unique('instruments_symbol_exchange_uniq').on(t.canonical_symbol, t.exchange),
++    angelSymbolIdx:     index('instruments_angel_broker_symbol_idx').on(t.angel_broker_symbol),
++    bseScripIdx:        index('instruments_bse_scrip_code_idx').on(t.bse_scrip_code),
++    statusIdx:          index('instruments_status_idx').on(t.status),
++  })
++)
++
++export const normalizedPrices = pgTable(
++  'normalized_prices',
++  {
++    instrument_id:    uuid('instrument_id').primaryKey().references(() => instruments.id, { onDelete: 'cascade' }),
++    price:            numeric('price', { precision: 12, scale: 4 }).notNull(),
++    change_pct:       numeric('change_pct', { precision: 8, scale: 4 }).notNull().default('0'),
++    currency:         text('currency').notNull().default('INR'),
++    source:           marketDataSourceEnum('source').notNull(),
++    as_of:            timestamp('as_of', { withTimezone: true }).notNull(),
++    fetched_at:       timestamp('fetched_at', { withTimezone: true }).notNull(),
++    raw_price:        numeric('raw_price', { precision: 12, scale: 4 }),
++    is_corp_adjusted: boolean('is_corp_adjusted').notNull().default(false),
++    updated_at:       timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
++  },
++  (t) => ({
++    fetchedAtIdx: index('normalized_prices_fetched_at_idx').on(t.fetched_at),
++  })
++)
++
++export const normalizedCorporateActions = pgTable(
++  'normalized_corporate_actions',
++  {
++    id:                uuid('id').defaultRandom().primaryKey(),
++    instrument_id:     uuid('instrument_id').notNull().references(() => instruments.id, { onDelete: 'cascade' }),
++    action_type:       corporateActionTypeEnum('action_type').notNull(),
++    ex_date:           date('ex_date').notNull(),
++    ratio_numerator:   numeric('ratio_numerator', { precision: 12, scale: 4 }),
++    ratio_denominator: numeric('ratio_denominator', { precision: 12, scale: 4 }),
++    old_symbol:        text('old_symbol'),
++    new_symbol:        text('new_symbol'),
++    source:            text('source').notNull().default('manual'),
++    notes:             text('notes'),
++    payload_json:      jsonb('payload_json'),
++    created_at:        timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
++  },
++  (t) => ({
++    instrumentExDateIdx: index('normalized_corp_actions_instrument_idx').on(t.instrument_id, t.ex_date),
++    corpActionUniq: unique('normalized_corp_actions_uniq').on(t.instrument_id, t.action_type, t.ex_date),
++  })
++)
++
++// ─── Price Cache (legacy read path — dual-written from market data service) ───
+ 
+ export const priceCache = pgTable('price_cache', {
+   ticker:     text('ticker').primaryKey(),
+@@ -565,3 +644,10 @@ export type OpportunityScore    = typeof opportunityScores.$inferSelect
+ export type NewOpportunityScore = typeof opportunityScores.$inferInsert
+ export type RegimeState         = typeof regimeState.$inferSelect
+ export type NewRegimeState      = typeof regimeState.$inferInsert
++
++export type Instrument                 = typeof instruments.$inferSelect
++export type NewInstrument              = typeof instruments.$inferInsert
++export type NormalizedPrice            = typeof normalizedPrices.$inferSelect
++export type NewNormalizedPrice         = typeof normalizedPrices.$inferInsert
++export type NormalizedCorporateAction  = typeof normalizedCorporateActions.$inferSelect
++export type NewNormalizedCorporateAction = typeof normalizedCorporateActions.$inferInsert
+diff --git a/src/server/repositories/instrumentRepository.ts b/src/server/repositories/instrumentRepository.ts
+new file mode 100644
+index 0000000..20b5f58
+--- /dev/null
++++ b/src/server/repositories/instrumentRepository.ts
+@@ -0,0 +1,79 @@
++import { and, eq, inArray, or } from 'drizzle-orm'
++import { db } from '@/server/db'
++import { instruments } from '@/server/db/schema'
++import type { Instrument, NewInstrument } from '@/server/db/schema'
++import { stripBrokerSuffix, isBseBrokerSymbol } from '@/services/brokers/exchangeUtils'
++import { toYahooSymbol } from '@/services/brokers/symbolMapper'
++
++export async function findInstrumentByTicker(ticker: string): Promise<Instrument | null> {
++  const base = stripBrokerSuffix(ticker).toUpperCase()
++  const angel = ticker.includes('-') ? ticker.toUpperCase() : `${base}-EQ`
++  const exchange = isBseBrokerSymbol(ticker) ? 'BSE' : 'NSE'
++
++  const rows = await db
++    .select()
++    .from(instruments)
++    .where(
++      or(
++        and(eq(instruments.canonical_symbol, base), eq(instruments.exchange, exchange)),
++        eq(instruments.angel_broker_symbol, angel),
++        eq(instruments.canonical_symbol, ticker.toUpperCase()),
++      )
++    )
++    .limit(1)
++
++  return rows[0] ?? null
++}
++
++export async function ensureInstrument(ticker: string, companyName?: string): Promise<Instrument> {
++  const existing = await findInstrumentByTicker(ticker)
++  if (existing) return existing
++
++  const base = stripBrokerSuffix(ticker).toUpperCase()
++  const exchange = isBseBrokerSymbol(ticker) ? 'BSE' : 'NSE'
++  const angel = ticker.includes('-') ? ticker.toUpperCase() : `${base}-EQ`
++  let yahooSymbol = `${base}.NS`
++  try {
++    yahooSymbol = await toYahooSymbol(angel)
++  } catch {
++    yahooSymbol = exchange === 'BSE' ? `${base}.BO` : `${base}.NS`
++  }
++
++  const row: NewInstrument = {
++    canonical_symbol: base,
++    exchange,
++    angel_broker_symbol: angel,
++    yahoo_symbol: yahooSymbol,
++    company_name: companyName ?? null,
++    status: 'active',
++  }
++
++  const inserted = await db
++    .insert(instruments)
++    .values(row)
++    .onConflictDoUpdate({
++      target: [instruments.canonical_symbol, instruments.exchange],
++      set: {
++        angel_broker_symbol: angel,
++        yahoo_symbol: yahooSymbol,
++        updated_at: new Date(),
++      },
++    })
++    .returning()
++
++  return inserted[0]!
++}
++
++export async function ensureInstruments(tickers: string[]): Promise<Map<string, Instrument>> {
++  const unique = Array.from(new Set(tickers.filter(Boolean)))
++  const map = new Map<string, Instrument>()
++  for (const ticker of unique) {
++    map.set(ticker, await ensureInstrument(ticker))
++  }
++  return map
++}
++
++export async function getInstrumentsByIds(ids: string[]): Promise<Instrument[]> {
++  if (ids.length === 0) return []
++  return db.select().from(instruments).where(inArray(instruments.id, ids))
++}
+diff --git a/src/server/repositories/marketDataRepository.ts b/src/server/repositories/marketDataRepository.ts
+new file mode 100644
+index 0000000..039e2d6
+--- /dev/null
++++ b/src/server/repositories/marketDataRepository.ts
+@@ -0,0 +1,73 @@
++import { desc, eq, inArray } from 'drizzle-orm'
++import { db } from '@/server/db'
++import {
++  normalizedCorporateActions,
++  normalizedPrices,
++} from '@/server/db/schema'
++import type {
++  NewNormalizedCorporateAction,
++  NewNormalizedPrice,
++  NormalizedCorporateAction,
++  NormalizedPrice,
++} from '@/server/db/schema'
++
++const FRESH_MS = 5 * 60 * 1000
++
++export function isNormalizedPriceFresh(row: NormalizedPrice): boolean {
++  return Date.now() - row.fetched_at.getTime() < FRESH_MS
++}
++
++export async function getNormalizedPrices(
++  instrumentIds: string[],
++): Promise<Map<string, NormalizedPrice>> {
++  if (instrumentIds.length === 0) return new Map()
++  const rows = await db
++    .select()
++    .from(normalizedPrices)
++    .where(inArray(normalizedPrices.instrument_id, instrumentIds))
++  return new Map(rows.map((r) => [r.instrument_id, r]))
++}
++
++export async function upsertNormalizedPrice(data: NewNormalizedPrice): Promise<void> {
++  await db
++    .insert(normalizedPrices)
++    .values(data)
++    .onConflictDoUpdate({
++      target: normalizedPrices.instrument_id,
++      set: {
++        price: data.price,
++        change_pct: data.change_pct,
++        source: data.source,
++        as_of: data.as_of,
++        fetched_at: data.fetched_at,
++        raw_price: data.raw_price,
++        is_corp_adjusted: data.is_corp_adjusted,
++        updated_at: new Date(),
++      },
++    })
++}
++
++export async function upsertNormalizedPrices(rows: NewNormalizedPrice[]): Promise<void> {
++  for (const row of rows) {
++    await upsertNormalizedPrice(row)
++  }
++}
++
++export async function getCorporateActions(
++  instrumentId: string,
++): Promise<NormalizedCorporateAction[]> {
++  return db
++    .select()
++    .from(normalizedCorporateActions)
++    .where(eq(normalizedCorporateActions.instrument_id, instrumentId))
++    .orderBy(desc(normalizedCorporateActions.ex_date))
++}
++
++export async function upsertCorporateAction(
++  data: NewNormalizedCorporateAction,
++): Promise<void> {
++  await db
++    .insert(normalizedCorporateActions)
++    .values(data)
++    .onConflictDoNothing()
++}
+diff --git a/src/services/brokers/broker.ts b/src/services/brokers/broker.ts
+index f0238d8..e43515b 100644
+--- a/src/services/brokers/broker.ts
++++ b/src/services/brokers/broker.ts
+@@ -1,35 +1,25 @@
+ /**
+  * Active broker selector — the ONLY import path for broker functionality.
+  *
+- * All consuming code must import from here:
+- *   import { getActiveBroker } from '@/services/brokers/broker'
+- *
+- * Never import angelOne.ts or yahooFallback.ts directly from outside this file.
+- * This guarantees broker can be swapped without touching any other file.
+- *
+- * Fallback policy:
+- *   - Use Angel One as primary
+- *   - If Angel One auth has failed twice consecutively, switch to Yahoo silently
+- *   - Never crash a request because of broker auth issues
++ * Holdings: Angel One (with Yahoo fallback on auth failure).
++ * Prices: Market Data Service (Angel → NSE → BSE → Yahoo, normalized DB).
+  */
+ 
+ import type { BrokerService } from './types'
+ import { angelOneService, getConsecutiveAuthFailures } from './angelOne'
+ import { yahooFallbackService } from './yahooFallback'
++import { getPrice, getPrices } from '@/services/marketData/marketDataService'
+ 
+ const MAX_AUTH_FAILURES_BEFORE_FALLBACK = 2
+ 
+ export function getActiveBroker(): BrokerService {
+-  const baseBroker = getConsecutiveAuthFailures() >= MAX_AUTH_FAILURES_BEFORE_FALLBACK
++  const holdingsBroker = getConsecutiveAuthFailures() >= MAX_AUTH_FAILURES_BEFORE_FALLBACK
+     ? yahooFallbackService
+     : angelOneService
+ 
+   return {
+-    getHoldings: () => baseBroker.getHoldings(),
+-    // Always use Yahoo/Tickertape fallback service for price queries to guarantee resilience,
+-    // resolve alphanumeric symbols instantly without token mappings, and capture accurate sectors.
+-    getPrice: (ticker) => yahooFallbackService.getPrice(ticker),
+-    getPrices: (tickers) => yahooFallbackService.getPrices(tickers),
++    getHoldings: () => holdingsBroker.getHoldings(),
++    getPrice: (ticker) => getPrice(ticker),
++    getPrices: (tickers) => getPrices(tickers),
+   }
+ }
+-
+diff --git a/src/services/brokers/types.ts b/src/services/brokers/types.ts
+index 1b8f7d3..e8f4957 100644
+--- a/src/services/brokers/types.ts
++++ b/src/services/brokers/types.ts
+@@ -2,7 +2,7 @@ export interface PriceData {
+   ticker: string
+   price: number
+   change_pct: number
+-  source: 'angel_one' | 'yahoo'
++  source: 'angel_one' | 'yahoo' | 'nse' | 'bse' | 'aggregated'
+   fetched_at: Date
+   stale_data: boolean
+ }
+diff --git a/src/services/marketData/corporateActions.test.ts b/src/services/marketData/corporateActions.test.ts
+new file mode 100644
+index 0000000..ace1577
+--- /dev/null
++++ b/src/services/marketData/corporateActions.test.ts
+@@ -0,0 +1,55 @@
++import { describe, expect, it } from 'vitest'
++import { applyCorporateAdjustments } from './corporateActions'
++
++describe('applyCorporateAdjustments', () => {
++  it('halves price on 1:2 split after ex-date', () => {
++    const { adjustedPrice, isAdjusted } = applyCorporateAdjustments(
++      1000,
++      [{
++        action_type: 'split',
++        ex_date: '2024-01-01',
++        ratio_numerator: 1,
++        ratio_denominator: 2,
++        old_symbol: null,
++        new_symbol: null,
++      }],
++      new Date('2024-06-01'),
++    )
++    expect(isAdjusted).toBe(true)
++    expect(adjustedPrice).toBe(500)
++  })
++
++  it('halves price on 1:1 bonus', () => {
++    const { adjustedPrice, isAdjusted } = applyCorporateAdjustments(
++      200,
++      [{
++        action_type: 'bonus',
++        ex_date: '2024-03-01',
++        ratio_numerator: 1,
++        ratio_denominator: 1,
++        old_symbol: null,
++        new_symbol: null,
++      }],
++      new Date('2024-06-01'),
++    )
++    expect(isAdjusted).toBe(true)
++    expect(adjustedPrice).toBe(100)
++  })
++
++  it('ignores future corporate actions', () => {
++    const { adjustedPrice, isAdjusted } = applyCorporateAdjustments(
++      100,
++      [{
++        action_type: 'split',
++        ex_date: '2025-12-01',
++        ratio_numerator: 1,
++        ratio_denominator: 2,
++        old_symbol: null,
++        new_symbol: null,
++      }],
++      new Date('2024-06-01'),
++    )
++    expect(isAdjusted).toBe(false)
++    expect(adjustedPrice).toBe(100)
++  })
++})
+diff --git a/src/services/marketData/corporateActions.ts b/src/services/marketData/corporateActions.ts
+new file mode 100644
+index 0000000..67f4975
+--- /dev/null
++++ b/src/services/marketData/corporateActions.ts
+@@ -0,0 +1,38 @@
++import type { CorporateActionRow } from './types'
++
++/** Apply split/bonus adjustments to a raw exchange price (multiplicative factors). */
++export function applyCorporateAdjustments(
++  rawPrice: number,
++  actions: CorporateActionRow[],
++  asOf: Date = new Date(),
++): { adjustedPrice: number; isAdjusted: boolean } {
++  if (!Number.isFinite(rawPrice) || rawPrice <= 0 || actions.length === 0) {
++    return { adjustedPrice: rawPrice, isAdjusted: false }
++  }
++
++  const asOfDay = asOf.toISOString().slice(0, 10)
++  let factor = 1
++  let adjusted = false
++
++  for (const action of actions) {
++    const exDay = String(action.ex_date)
++    if (exDay > asOfDay) continue
++
++    const num = Number(action.ratio_numerator ?? 0)
++    const den = Number(action.ratio_denominator ?? 0)
++
++    if (action.action_type === 'split' && num > 0 && den > 0) {
++      // e.g. 1:2 split → price halves
++      factor *= num / den
++      adjusted = true
++    } else if (action.action_type === 'bonus' && num > 0 && den > 0) {
++      // e.g. 1:1 bonus → 2x shares → price halves
++      factor *= den / (num + den)
++      adjusted = true
++    }
++    // symbol_change / delisting handled at instrument resolution layer
++  }
++
++  if (!adjusted) return { adjustedPrice: rawPrice, isAdjusted: false }
++  return { adjustedPrice: rawPrice * factor, isAdjusted: true }
++}
+diff --git a/src/services/marketData/marketDataService.ts b/src/services/marketData/marketDataService.ts
+new file mode 100644
+index 0000000..364df39
+--- /dev/null
++++ b/src/services/marketData/marketDataService.ts
+@@ -0,0 +1,180 @@
++/**
++ * Market Data Service — single entry point for all price consumers.
++ *
++ * Flow: resolve instrument → read normalized_prices cache → provider fan-out
++ * (Angel → NSE → BSE → Yahoo) → corporate action adjustment → persist
++ * normalized_prices + legacy price_cache.
++ */
++
++import type { PriceData } from '@/services/brokers/types'
++import { isOlderThan24Hours, upsertPrices } from '@/server/repositories/priceRepository'
++import { ensureInstruments } from '@/server/repositories/instrumentRepository'
++import {
++  getCorporateActions,
++  getNormalizedPrices,
++  isNormalizedPriceFresh,
++  upsertNormalizedPrice,
++} from '@/server/repositories/marketDataRepository'
++import { applyCorporateAdjustments } from './corporateActions'
++import { angelProvider } from './providers/angelProvider'
++import { yahooProvider } from './providers/yahooProvider'
++import { nseProvider } from './providers/nseProvider'
++import { bseProvider } from './providers/bseProvider'
++import type { MarketDataProvider, RawQuote } from './types'
++import type { Instrument } from '@/server/db/schema'
++
++const PROVIDERS: MarketDataProvider[] = [
++  angelProvider,
++  nseProvider,
++  bseProvider,
++  yahooProvider,
++].sort((a, b) => a.priority - b.priority)
++
++function toPriceData(ticker: string, quote: {
++  price: number
++  change_pct: number
++  source: PriceData['source']
++  fetched_at: Date
++}): PriceData {
++  return {
++    ticker,
++    price: quote.price,
++    change_pct: quote.change_pct,
++    source: quote.source,
++    fetched_at: quote.fetched_at,
++    stale_data: isOlderThan24Hours(quote.fetched_at),
++  }
++}
++
++function mapSourceToLegacy(source: RawQuote['source'] | 'aggregated'): PriceData['source'] {
++  if (source === 'aggregated') return 'aggregated'
++  if (source === 'nse') return 'nse'
++  if (source === 'bse') return 'bse'
++  return source
++}
++
++async function fetchFromProviders(instrument: Instrument): Promise<RawQuote | null> {
++  for (const provider of PROVIDERS) {
++    const quote = await provider.getQuote(instrument)
++    if (quote && quote.price > 0) return quote
++  }
++  return null
++}
++
++async function resolveQuoteForInstrument(
++  instrument: Instrument,
++  ticker: string,
++  forceRefresh = false,
++): Promise<PriceData> {
++  const cachedMap = await getNormalizedPrices([instrument.id])
++  const cached = cachedMap.get(instrument.id)
++
++  if (!forceRefresh && cached && isNormalizedPriceFresh(cached) && Number(cached.price) > 0) {
++    return toPriceData(ticker, {
++      price: Number(cached.price),
++      change_pct: Number(cached.change_pct),
++      source: cached.source as PriceData['source'],
++      fetched_at: cached.fetched_at,
++    })
++  }
++
++  const raw = await fetchFromProviders(instrument)
++  if (!raw) {
++    if (cached && Number(cached.price) > 0) {
++      return toPriceData(ticker, {
++        price: Number(cached.price),
++        change_pct: Number(cached.change_pct),
++        source: cached.source as PriceData['source'],
++        fetched_at: cached.fetched_at,
++      })
++    }
++    return {
++      ticker,
++      price: 0,
++      change_pct: 0,
++      source: 'yahoo',
++      fetched_at: new Date(0),
++      stale_data: true,
++    }
++  }
++
++  const corpActions = await getCorporateActions(instrument.id)
++  const { adjustedPrice, isAdjusted } = applyCorporateAdjustments(raw.price, corpActions, raw.as_of)
++  const legacySource = mapSourceToLegacy(raw.source)
++
++  await upsertNormalizedPrice({
++    instrument_id: instrument.id,
++    price: String(adjustedPrice),
++    change_pct: String(raw.change_pct),
++    currency: 'INR',
++    source: raw.source,
++    as_of: raw.as_of,
++    fetched_at: raw.fetched_at,
++    raw_price: String(raw.price),
++    is_corp_adjusted: isAdjusted,
++  })
++
++  return toPriceData(ticker, {
++    price: adjustedPrice,
++    change_pct: raw.change_pct,
++    source: legacySource,
++    fetched_at: raw.fetched_at,
++  })
++}
++
++export async function getPrice(ticker: string, forceRefresh = false): Promise<PriceData> {
++  const instrument = await ensureInstruments([ticker]).then((m) => m.get(ticker)!)
++  return resolveQuoteForInstrument(instrument, ticker, forceRefresh)
++}
++
++export async function getPrices(
++  tickers: string[],
++  forceRefresh = false,
++): Promise<Map<string, PriceData>> {
++  const unique = Array.from(new Set(tickers.filter(Boolean)))
++  if (unique.length === 0) return new Map()
++
++  const instrumentMap = await ensureInstruments(unique)
++  const results = new Map<string, PriceData>()
++  const toPersist: Array<{
++    ticker: string
++    price: string
++    change_pct: string
++    source: PriceData['source']
++    fetched_at: Date
++  }> = []
++
++  for (const ticker of unique) {
++    const instrument = instrumentMap.get(ticker)!
++    const quote = await resolveQuoteForInstrument(instrument, ticker, forceRefresh)
++    results.set(ticker, quote)
++    if (quote.price > 0) {
++      toPersist.push({
++        ticker,
++        price: String(quote.price),
++        change_pct: String(quote.change_pct),
++        source: quote.source,
++        fetched_at: quote.fetched_at,
++      })
++    }
++  }
++
++  await upsertPrices(toPersist)
++  return results
++}
++
++/** Refresh all active portfolio tickers — called by cron. */
++export async function syncMarketDataForTickers(tickers: string[]): Promise<{
++  synced: number
++  failed: number
++}> {
++  const prices = await getPrices(tickers, true)
++  let synced = 0
++  let failed = 0
++  for (const ticker of tickers) {
++    const p = prices.get(ticker)
++    if (p && p.price > 0) synced++
++    else failed++
++  }
++  return { synced, failed }
++}
+diff --git a/src/services/marketData/providers/angelProvider.ts b/src/services/marketData/providers/angelProvider.ts
+new file mode 100644
+index 0000000..8958214
+--- /dev/null
++++ b/src/services/marketData/providers/angelProvider.ts
+@@ -0,0 +1,28 @@
++import type { Instrument } from '@/server/db/schema'
++import type { MarketDataProvider, RawQuote } from '../types'
++import { angelOneService } from '@/services/brokers/angelOne'
++
++export const angelProvider: MarketDataProvider = {
++  name: 'angel_one',
++  priority: 10,
++
++  async getQuote(instrument: Instrument): Promise<RawQuote | null> {
++    const ticker = instrument.angel_broker_symbol
++      ?? `${instrument.canonical_symbol}-EQ`
++
++    try {
++      const data = await angelOneService.getPrice(ticker)
++      if (!data.price || data.price <= 0) return null
++
++      return {
++        price: data.price,
++        change_pct: data.change_pct,
++        source: 'angel_one',
++        as_of: data.fetched_at,
++        fetched_at: data.fetched_at,
++      }
++    } catch {
++      return null
++    }
++  },
++}
+diff --git a/src/services/marketData/providers/bseProvider.ts b/src/services/marketData/providers/bseProvider.ts
+new file mode 100644
+index 0000000..c1e104c
+--- /dev/null
++++ b/src/services/marketData/providers/bseProvider.ts
+@@ -0,0 +1,15 @@
++import type { Instrument } from '@/server/db/schema'
++import type { MarketDataProvider, RawQuote } from '../types'
++
++/**
++ * BSE quote provider — Phase 1 stub.
++ * Phase 2: wire BSE getScripHeaderData (packages/scanner/market.py).
++ */
++export const bseProvider: MarketDataProvider = {
++  name: 'bse',
++  priority: 25,
++
++  async getQuote(_instrument: Instrument): Promise<RawQuote | null> {
++    return null
++  },
++}
+diff --git a/src/services/marketData/providers/nseProvider.ts b/src/services/marketData/providers/nseProvider.ts
+new file mode 100644
+index 0000000..5bbf30e
+--- /dev/null
++++ b/src/services/marketData/providers/nseProvider.ts
+@@ -0,0 +1,15 @@
++import type { Instrument } from '@/server/db/schema'
++import type { MarketDataProvider, RawQuote } from '../types'
++
++/**
++ * NSE official quote provider — Phase 1 stub.
++ * Phase 2: wire NSE bhavcopy / quote API (same data as packages/scanner/market.py).
++ */
++export const nseProvider: MarketDataProvider = {
++  name: 'nse',
++  priority: 20,
++
++  async getQuote(_instrument: Instrument): Promise<RawQuote | null> {
++    return null
++  },
++}
+diff --git a/src/services/marketData/providers/yahooProvider.ts b/src/services/marketData/providers/yahooProvider.ts
+new file mode 100644
+index 0000000..31cbd11
+--- /dev/null
++++ b/src/services/marketData/providers/yahooProvider.ts
+@@ -0,0 +1,28 @@
++import type { Instrument } from '@/server/db/schema'
++import type { MarketDataProvider, RawQuote } from '../types'
++import { yahooFallbackService } from '@/services/brokers/yahooFallback'
++
++export const yahooProvider: MarketDataProvider = {
++  name: 'yahoo',
++  priority: 30,
++
++  async getQuote(instrument: Instrument): Promise<RawQuote | null> {
++    const ticker = instrument.angel_broker_symbol
++      ?? `${instrument.canonical_symbol}-EQ`
++
++    try {
++      const data = await yahooFallbackService.getPrice(ticker)
++      if (!data.price || data.price <= 0) return null
++
++      return {
++        price: data.price,
++        change_pct: data.change_pct,
++        source: 'yahoo',
++        as_of: data.fetched_at,
++        fetched_at: data.fetched_at,
++      }
++    } catch {
++      return null
++    }
++  },
++}
+diff --git a/src/services/marketData/types.ts b/src/services/marketData/types.ts
+new file mode 100644
+index 0000000..af3bbad
+--- /dev/null
++++ b/src/services/marketData/types.ts
+@@ -0,0 +1,35 @@
++import type { Instrument, NormalizedCorporateAction } from '@/server/db/schema'
++
++export type MarketDataProviderName = 'angel_one' | 'yahoo' | 'nse' | 'bse'
++
++export interface RawQuote {
++  price: number
++  change_pct: number
++  source: MarketDataProviderName
++  as_of: Date
++  fetched_at: Date
++}
++
++export interface NormalizedQuote {
++  ticker: string
++  instrument_id: string
++  price: number
++  change_pct: number
++  source: MarketDataProviderName | 'aggregated'
++  as_of: Date
++  fetched_at: Date
++  raw_price: number
++  is_corp_adjusted: boolean
++  stale_data: boolean
++}
++
++export interface MarketDataProvider {
++  name: MarketDataProviderName
++  priority: number
++  getQuote(instrument: Instrument): Promise<RawQuote | null>
++}
++
++export type CorporateActionRow = Pick<
++  NormalizedCorporateAction,
++  'action_type' | 'ex_date' | 'ratio_numerator' | 'ratio_denominator' | 'old_symbol' | 'new_symbol'
++>
+-- 
+2.43.0
+
