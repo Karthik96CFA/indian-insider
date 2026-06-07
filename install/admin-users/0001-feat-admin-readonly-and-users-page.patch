@@ -1,0 +1,2535 @@
+From 0eb33c6fac9f859256032ed90d2285248d7c1cf1 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Sun, 7 Jun 2026 04:17:34 +0000
+Subject: [PATCH 1/2] feat: admin vs view-only users (Pattern A read-only
+ mirror)
+
+- Add is_admin flag on user_settings (migration 0014)
+- ADMIN_EMAIL auto-promotes admin on login; public signup disabled by default
+- Non-admins see admin portfolio/pool data via getDataUserId()
+- requireAdmin() gates all mutations; settings telegram/password still per-user
+- Same nav for everyone; read-only banner and disabled action controls
+- Remove investor-only route blocking; unified view for all non-admins
+---
+ .env.example                                  |  4 ++
+ drizzle/migrations/0014_user_admin_flag.sql   |  1 +
+ drizzle/migrations/meta/_journal.json         |  7 ++
+ src/app/(auth)/login/page.tsx                 |  4 +-
+ src/app/(auth)/signup/page.tsx                | 21 +++++-
+ src/app/(dashboard)/add/page.tsx              | 13 ++++
+ src/app/(dashboard)/export/page.tsx           | 11 +++
+ src/app/(dashboard)/layout.tsx                | 25 ++++---
+ src/app/(dashboard)/page.tsx                  | 44 ++----------
+ src/app/(dashboard)/portfolio/page.tsx        | 42 ++++++-----
+ src/app/api/broker/holdings/route.ts          |  4 +-
+ src/components/alerts/AlertsClient.tsx        | 17 +++--
+ src/components/layout/AppAccessContext.tsx    | 31 ++++++++
+ src/components/layout/BottomNav.tsx           | 27 +++----
+ src/components/layout/CommandPalette.tsx      |  8 +--
+ src/components/layout/ReadOnlyBanner.tsx      | 19 +++++
+ src/components/layout/Sidebar.tsx             | 38 ++++------
+ src/components/pool/PoolFundClient.tsx        | 20 +++---
+ src/components/pool/PoolInvestorsPanel.tsx    |  6 +-
+ src/components/pool/PoolSettingsPanel.tsx     | 25 ++++---
+ src/components/stock/StockDetailClient.tsx    | 40 ++++++-----
+ src/components/watchlist/WatchlistClient.tsx  | 50 +++++++------
+ src/features/alerts/actions.ts                |  4 +-
+ src/features/auth/LoginForm.tsx               | 21 +++---
+ src/features/auth/actions.ts                  |  4 ++
+ src/features/export/actions.ts                |  4 ++
+ src/features/holdings/actions.ts              |  4 ++
+ src/features/holdings/detailActions.ts        | 10 ++-
+ src/features/quarterly/actions.ts             |  4 ++
+ src/features/research/actions.ts              |  3 +
+ src/features/watchlist/actions.ts             |  3 +
+ src/server/auth/appAccess.ts                  | 71 +++++++++++++++++++
+ src/server/auth/poolAccess.ts                 | 10 ++-
+ src/server/db/schema.ts                       |  1 +
+ src/server/repositories/alertsRepository.ts   | 14 ++--
+ src/server/repositories/holdingsRepository.ts | 22 +++---
+ src/server/repositories/poolRepository.ts     | 28 ++++----
+ .../repositories/quarterlyRepository.ts       | 16 ++---
+ src/server/repositories/researchRepository.ts |  8 +--
+ .../repositories/watchlistRepository.ts       |  8 +--
+ 40 files changed, 440 insertions(+), 252 deletions(-)
+ create mode 100644 drizzle/migrations/0014_user_admin_flag.sql
+ create mode 100644 src/components/layout/AppAccessContext.tsx
+ create mode 100644 src/components/layout/ReadOnlyBanner.tsx
+ create mode 100644 src/server/auth/appAccess.ts
+
+diff --git a/.env.example b/.env.example
+index 546c32b..303f523 100644
+--- a/.env.example
++++ b/.env.example
+@@ -23,3 +23,7 @@ CRON_SECRET=change-this-to-a-strong-random-secret-at-least-32-chars
+ # Signal ingestion from engine + BSE scanner (must match GitHub STOCKLENS_INTEGRATION_SECRET)
+ # Railway accepts either INTEGRATION_SECRET or STOCKLENS_INTEGRATION_SECRET
+ INTEGRATION_SECRET=change-this-to-a-strong-random-secret-at-least-32-chars
++
++# Admin access (Railway)
++# ADMIN_EMAIL=your@email.com          # Auto-promoted to admin on login
++# ALLOW_PUBLIC_SIGNUP=false           # Set to "true" only to re-enable /signup
+diff --git a/drizzle/migrations/0014_user_admin_flag.sql b/drizzle/migrations/0014_user_admin_flag.sql
+new file mode 100644
+index 0000000..e419ab5
+--- /dev/null
++++ b/drizzle/migrations/0014_user_admin_flag.sql
+@@ -0,0 +1 @@
++ALTER TABLE "user_settings" ADD COLUMN IF NOT EXISTS "is_admin" boolean DEFAULT false NOT NULL;
+diff --git a/drizzle/migrations/meta/_journal.json b/drizzle/migrations/meta/_journal.json
+index dd8ef00..2247924 100644
+--- a/drizzle/migrations/meta/_journal.json
++++ b/drizzle/migrations/meta/_journal.json
+@@ -99,6 +99,13 @@
+       "when": 1780804690325,
+       "tag": "0013_audit_log",
+       "breakpoints": true
++    },
++    {
++      "idx": 14,
++      "version": "7",
++      "when": 1781004690325,
++      "tag": "0014_user_admin_flag",
++      "breakpoints": true
+     }
+   ]
+ }
+\ No newline at end of file
+diff --git a/src/app/(auth)/login/page.tsx b/src/app/(auth)/login/page.tsx
+index 4e83863..d9155ff 100644
+--- a/src/app/(auth)/login/page.tsx
++++ b/src/app/(auth)/login/page.tsx
+@@ -1,9 +1,11 @@
+ import { BrandLogo } from '@/components/layout/BrandLogo'
+ import { LoginForm } from '@/features/auth/LoginForm'
++import { isPublicSignupAllowed } from '@/server/auth/appAccess'
+ 
+ export const metadata = { title: 'Sign in — StockLens' }
+ 
+ export default function LoginPage() {
++  const signupOpen = isPublicSignupAllowed()
+   return (
+     <main className="min-h-screen flex items-center justify-center px-4 relative overflow-hidden">
+       <BrandLogo />
+@@ -21,7 +23,7 @@ export default function LoginPage() {
+           <p className="mt-2 text-sm text-[#94a3b8]">Sign in to your portfolio command center</p>
+         </div>
+         <div className="card rounded-xl p-6">
+-          <LoginForm />
++          <LoginForm signupOpen={signupOpen} />
+         </div>
+       </div>
+     </main>
+diff --git a/src/app/(auth)/signup/page.tsx b/src/app/(auth)/signup/page.tsx
+index dba130f..8e54435 100644
+--- a/src/app/(auth)/signup/page.tsx
++++ b/src/app/(auth)/signup/page.tsx
+@@ -1,9 +1,13 @@
++import Link from 'next/link'
+ import { BrandLogo } from '@/components/layout/BrandLogo'
+ import { SignupForm } from '@/features/auth/SignupForm'
++import { isPublicSignupAllowed } from '@/server/auth/appAccess'
+ 
+ export const metadata = { title: 'Create account — StockLens' }
+ 
+ export default function SignupPage() {
++  const signupOpen = isPublicSignupAllowed()
++
+   return (
+     <main className="min-h-screen flex items-center justify-center px-4 relative overflow-hidden">
+       <BrandLogo />
+@@ -18,10 +22,23 @@ export default function SignupPage() {
+             <span className="text-sm font-bold text-white">SL</span>
+           </div>
+           <h1 className="page-title text-2xl">Join StockLens</h1>
+-          <p className="mt-2 text-sm text-[#94a3b8]">Create your portfolio command center</p>
++          <p className="mt-2 text-sm text-[#94a3b8]">
++            {signupOpen ? 'Create your portfolio command center' : 'Invite-only access'}
++          </p>
+         </div>
+         <div className="card rounded-xl p-6">
+-          <SignupForm />
++          {signupOpen ? (
++            <SignupForm />
++          ) : (
++            <div className="text-center space-y-4">
++              <p className="text-sm text-[#94a3b8]">
++                Public registration is closed. Ask the admin for an invite link.
++              </p>
++              <Link href="/login" className="text-[#22c55e] hover:underline text-sm">
++                Back to sign in
++              </Link>
++            </div>
++          )}
+         </div>
+       </div>
+     </main>
+diff --git a/src/app/(dashboard)/add/page.tsx b/src/app/(dashboard)/add/page.tsx
+index 2595a75..d2f236d 100644
+--- a/src/app/(dashboard)/add/page.tsx
++++ b/src/app/(dashboard)/add/page.tsx
+@@ -10,6 +10,7 @@ import { Download, PlusCircle } from 'lucide-react'
+ import { addHoldingSchema, type AddHoldingValues } from '@/features/holdings/schemas'
+ import { addHoldingAction, bulkImportHoldingsAction } from '@/features/holdings/actions'
+ import { AngelOneImportModal } from '@/components/dashboard/AngelOneImportModal'
++import { useAppAccess } from '@/components/layout/AppAccessContext'
+ import type { Holding as BrokerHolding } from '@/services/brokers/types'
+ 
+ function convictionMeta(score: number) {
+@@ -22,6 +23,7 @@ function AddStockForm() {
+   const router       = useRouter()
+   const searchParams = useSearchParams()
+   const queryClient  = useQueryClient()
++  const { isReadOnly } = useAppAccess()
+   const [showModal, setShowModal] = useState(false)
+ 
+   const {
+@@ -104,6 +106,17 @@ function AddStockForm() {
+ 
+   const errorCls = 'text-xs text-[#fb7185] mt-1.5'
+ 
++  if (isReadOnly) {
++    return (
++      <div className="max-w-lg mx-auto card rounded-xl p-8 text-center space-y-3">
++        <h1 className="page-title text-xl">Add Stock</h1>
++        <p className="text-sm text-[#94a3b8]">
++          View-only access — you can browse the portfolio but cannot add or import holdings.
++        </p>
++      </div>
++    )
++  }
++
+   return (
+     <>
+       {showModal && (
+diff --git a/src/app/(dashboard)/export/page.tsx b/src/app/(dashboard)/export/page.tsx
+index cf21072..b1999e4 100644
+--- a/src/app/(dashboard)/export/page.tsx
++++ b/src/app/(dashboard)/export/page.tsx
+@@ -8,8 +8,10 @@ import {
+   exportSellHistoryAction,
+ } from '@/features/export/actions'
+ import { Download, Database, BookOpen, Calendar, Loader2 } from 'lucide-react'
++import { useAppAccess } from '@/components/layout/AppAccessContext'
+ 
+ export default function ExportPage() {
++  const { isReadOnly } = useAppAccess()
+   const [downloadingHoldings, setDownloadingHoldings] = useState(false)
+   const [downloadingQuarterly, setDownloadingQuarterly] = useState(false)
+   const [downloadingSell, setDownloadingSell] = useState(false)
+@@ -75,6 +77,15 @@ export default function ExportPage() {
+   const cardCls = 'bg-[#1a1a1a] border border-[#2a2a2a] rounded-sm p-5 shadow-lg flex flex-col md:flex-row md:items-center justify-between gap-4 transition-all hover:border-[#22c55e]/20'
+   const btnCls = 'px-4 py-2.5 bg-[#22c55e] text-black font-semibold rounded-sm hover:bg-[#16a34a] disabled:opacity-40 transition-colors text-xs flex items-center justify-center gap-1.5 shrink-0 w-full md:w-auto'
+ 
++  if (isReadOnly) {
++    return (
++      <div className="max-w-2xl mx-auto card rounded-xl p-8 text-center space-y-3">
++        <h1 className="page-title text-xl">Export Hub</h1>
++        <p className="text-sm text-[#94a3b8]">Data export is available to the admin only.</p>
++      </div>
++    )
++  }
++
+   return (
+     <div className="max-w-2xl mx-auto space-y-6">
+       {/* Page Header */}
+diff --git a/src/app/(dashboard)/layout.tsx b/src/app/(dashboard)/layout.tsx
+index d4cea2a..5b789ac 100644
+--- a/src/app/(dashboard)/layout.tsx
++++ b/src/app/(dashboard)/layout.tsx
+@@ -4,9 +4,10 @@ import { Sidebar }   from '@/components/layout/Sidebar'
+ import { BottomNav } from '@/components/layout/BottomNav'
+ import { TopHeader } from '@/components/layout/TopHeader'
+ import { CommandPalette } from '@/components/layout/CommandPalette'
+-import { InvestorRouteGuard } from '@/components/layout/InvestorRouteGuard'
+-import { PoolRoleProvider } from '@/components/layout/PoolRoleContext'
+-import { activateInvestorOnLogin, getPoolAccess } from '@/server/auth/poolAccess'
++import { AppAccessProvider } from '@/components/layout/AppAccessContext'
++import { ReadOnlyBanner } from '@/components/layout/ReadOnlyBanner'
++import { activateInvestorOnLogin } from '@/server/auth/poolAccess'
++import { ensureAdminOnLogin, getIsAdmin } from '@/server/auth/appAccess'
+ import { createSupabaseServerClient } from '@/server/db/supabase'
+ 
+ export default async function DashboardLayout({
+@@ -20,29 +21,27 @@ export default async function DashboardLayout({
+   if (!user) redirect('/login')
+ 
+   await activateInvestorOnLogin(user.id, user.email ?? '')
+-  const access = await getPoolAccess(user.id)
+-  const isInvestor = access?.role === 'investor'
++  await ensureAdminOnLogin(user.id, user.email ?? '')
++  const isAdmin = await getIsAdmin()
+ 
+   return (
+-    <PoolRoleProvider isInvestor={isInvestor}>
++    <AppAccessProvider isAdmin={isAdmin}>
+       <div className="flex min-h-screen app-shell">
+-        <Sidebar userEmail={user.email ?? ''} isInvestor={isInvestor} />
++        <Sidebar userEmail={user.email ?? ''} isAdmin={isAdmin} />
+ 
+         <div className="flex-1 flex flex-col min-h-screen">
+           <BrandLogo className="pointer-events-none fixed top-[4.25rem] right-4 z-20 select-none" />
+           <TopHeader userEmail={user.email ?? ''} />
+ 
+           <main className="flex-1 p-4 md:p-6 pb-20 md:pb-6">
+-            <InvestorRouteGuard isInvestor={isInvestor}>
+-              {children}
+-            </InvestorRouteGuard>
++            <ReadOnlyBanner />
++            {children}
+           </main>
+         </div>
+ 
+-        <BottomNav isInvestor={isInvestor} />
++        <BottomNav />
+         <CommandPalette />
+       </div>
+-    </PoolRoleProvider>
++    </AppAccessProvider>
+   )
+ }
+-
+diff --git a/src/app/(dashboard)/page.tsx b/src/app/(dashboard)/page.tsx
+index 71ae582..144f264 100644
+--- a/src/app/(dashboard)/page.tsx
++++ b/src/app/(dashboard)/page.tsx
+@@ -1,9 +1,6 @@
+ import { PoolFundClient } from '@/components/pool/PoolFundClient'
+-import { PoolInvestorPortal } from '@/components/pool/PoolInvestorPortal'
+-import { activateInvestorOnLogin, getPoolAccess } from '@/server/auth/poolAccess'
+-import { createSupabaseServerClient, getAuthenticatedUserId } from '@/server/db/supabase'
++import { getDataUserId } from '@/server/auth/appAccess'
+ import {
+-  getInvestorPortalSummary,
+   getPoolCapTable,
+   getPoolInvestorTransactions,
+   getPoolInvestors,
+@@ -22,48 +19,19 @@ export const metadata = {
+ }
+ 
+ export default async function PoolHomePage() {
+-  const userId = await getAuthenticatedUserId()
+-  const supabase = createSupabaseServerClient()
+-  const { data: { user } } = await supabase.auth.getUser()
+-
+-  if (user?.email) {
+-    await activateInvestorOnLogin(userId, user.email)
+-  }
+-
+-  const access = await getPoolAccess(userId)
+-
+-  if (access.role === 'investor' && access.investorId) {
+-    const [published, summary] = await Promise.all([
+-      getPoolNavPublished(access.poolUserId),
+-      getInvestorPortalSummary(access.poolUserId, access.investorId),
+-    ])
+-
+-    const [managerConfig] = await Promise.all([
+-      getPoolConfig(access.poolUserId),
+-    ])
+-
+-    return (
+-      <PoolInvestorPortal
+-        fundName={managerConfig.name}
+-        investorName={access.investorName ?? summary.investor?.name ?? 'Investor'}
+-        published={published}
+-        totalUnits={Number(summary.units?.total_units ?? 0)}
+-        transactions={summary.transactions}
+-      />
+-    )
+-  }
++  const dataUserId = await getDataUserId()
+ 
+   const [config, drafts, published, latestImport, snapshots, assets, investors, transactions, capTable] =
+     await Promise.all([
+-      getPoolConfig(userId),
++      getPoolConfig(dataUserId),
+       getPoolNavDrafts(),
+       getPoolNavPublished(),
+       getLatestImportBatch(),
+       getPoolDailySnapshots(),
+       getPoolAssets(),
+-      getPoolInvestors(userId),
+-      getPoolInvestorTransactions(userId),
+-      getPoolCapTable(userId),
++      getPoolInvestors(dataUserId),
++      getPoolInvestorTransactions(dataUserId),
++      getPoolCapTable(dataUserId),
+     ])
+ 
+   return (
+diff --git a/src/app/(dashboard)/portfolio/page.tsx b/src/app/(dashboard)/portfolio/page.tsx
+index 5e71844..0e51366 100644
+--- a/src/app/(dashboard)/portfolio/page.tsx
++++ b/src/app/(dashboard)/portfolio/page.tsx
+@@ -1,5 +1,6 @@
+ import { Suspense } from 'react'
+ import { AuditFeed } from '@/components/audit/AuditFeed'
++import { getIsAdmin } from '@/server/auth/appAccess'
+ import { getAuthenticatedUserId } from '@/server/db/supabase'
+ import { getHoldings, getPortfolioSnapshots, getTotalRealisedPnL } from '@/server/repositories/holdingsRepository'
+ import { getCachedPrices, isOlderThan24Hours } from '@/server/repositories/priceRepository'
+@@ -43,8 +44,9 @@ async function HoldingsSection() {
+     snapshots = fetchedSnapshots
+     realizedPnL = fetchedRealizedPnL
+ 
++    const isAdmin = await getIsAdmin()
+     const nullSectorHoldings = (holdings ?? []).filter((h) => !h.sector)
+-    if (nullSectorHoldings.length > 0) {
++    if (isAdmin && nullSectorHoldings.length > 0) {
+       import('@/features/holdings/actions').then(({ enrichHoldingSectorAction }) => {
+         for (const h of nullSectorHoldings) {
+           void enrichHoldingSectorAction(h.ticker)
+@@ -100,7 +102,9 @@ function HoldingsSkeleton() {
+   )
+ }
+ 
+-export default function PortfolioPage() {
++export default async function PortfolioPage() {
++  const isAdmin = await getIsAdmin()
++
+   return (
+     <div className="space-y-6 animate-fade-in">
+       <div className="page-header flex flex-col sm:flex-row sm:items-start sm:justify-between gap-3 mb-2">
+@@ -114,22 +118,24 @@ export default function PortfolioPage() {
+             Click any row in the table to open that stock&apos;s detail page.
+           </p>
+         </div>
+-        <div className="flex gap-2 shrink-0">
+-          <Link
+-            href="/add?source=angel_one"
+-            className="btn-ghost"
+-            title="Pull your current broker positions from Angel One into this portfolio"
+-          >
+-            Import Angel One
+-          </Link>
+-          <Link
+-            href="/add"
+-            className="btn-primary"
+-            title="Manually enter a new stock with buy price, thesis, and conviction"
+-          >
+-            + Add Stock
+-          </Link>
+-        </div>
++        {isAdmin && (
++          <div className="flex gap-2 shrink-0">
++            <Link
++              href="/add?source=angel_one"
++              className="btn-ghost"
++              title="Pull your current broker positions from Angel One into this portfolio"
++            >
++              Import Angel One
++            </Link>
++            <Link
++              href="/add"
++              className="btn-primary"
++              title="Manually enter a new stock with buy price, thesis, and conviction"
++            >
++              + Add Stock
++            </Link>
++          </div>
++        )}
+       </div>
+ 
+       <Suspense fallback={<HoldingsSkeleton />}>
+diff --git a/src/app/api/broker/holdings/route.ts b/src/app/api/broker/holdings/route.ts
+index 9148d83..12f69dd 100644
+--- a/src/app/api/broker/holdings/route.ts
++++ b/src/app/api/broker/holdings/route.ts
+@@ -1,10 +1,10 @@
+ import { NextResponse } from 'next/server'
+-import { getAuthenticatedUserId } from '@/server/db/supabase'
++import { requireAdmin } from '@/server/auth/appAccess'
+ import { getActiveBroker } from '@/services/brokers/broker'
+ 
+ export async function GET() {
+   try {
+-    await getAuthenticatedUserId()
++    await requireAdmin()
+     const broker   = getActiveBroker()
+     const holdings = await broker.getHoldings()
+     return NextResponse.json({ holdings })
+diff --git a/src/components/alerts/AlertsClient.tsx b/src/components/alerts/AlertsClient.tsx
+index e562a44..61e8e0d 100644
+--- a/src/components/alerts/AlertsClient.tsx
++++ b/src/components/alerts/AlertsClient.tsx
+@@ -16,6 +16,7 @@ import {
+ import { updateSignalStatusAction } from '@/features/alerts/actions'
+ import { toast } from 'sonner'
+ import { ALERT_PANES } from '@/lib/navigation'
++import { useAppAccess } from '@/components/layout/AppAccessContext'
+ import {
+   buildHoldingsTickerMap,
+   buildWatchlistTickerSet,
+@@ -52,6 +53,7 @@ interface Props {
+ }
+ 
+ export function AlertsClient({ initialAlerts, holdings, watchlist, initialSignals }: Props) {
++  const { isReadOnly } = useAppAccess()
+   const [selectedHoldingId, setSelectedHoldingId] = useState<string>('all')
+   const [activePane, setActivePane] = useState<'queue' | 'history'>('queue')
+ 
+@@ -226,7 +228,7 @@ export function AlertsClient({ initialAlerts, holdings, watchlist, initialSignal
+                   </div>
+                   <div className="space-y-2">
+                     {highPriority.map((signal) => (
+-                      <SignalCard key={signal.id} signal={signal} onStatusChange={handleStatusChange} />
++                      <SignalCard key={signal.id} signal={signal} readOnly={isReadOnly} onStatusChange={handleStatusChange} />
+                     ))}
+                   </div>
+                 </div>
+@@ -241,7 +243,7 @@ export function AlertsClient({ initialAlerts, holdings, watchlist, initialSignal
+                   </div>
+                   <div className="space-y-2">
+                     {mediumPriority.map((signal) => (
+-                      <SignalCard key={signal.id} signal={signal} onStatusChange={handleStatusChange} />
++                      <SignalCard key={signal.id} signal={signal} readOnly={isReadOnly} onStatusChange={handleStatusChange} />
+                     ))}
+                   </div>
+                 </div>
+@@ -256,7 +258,7 @@ export function AlertsClient({ initialAlerts, holdings, watchlist, initialSignal
+                   </div>
+                   <div className="space-y-2">
+                     {lowPriority.map((signal) => (
+-                      <SignalCard key={signal.id} signal={signal} onStatusChange={handleStatusChange} />
++                      <SignalCard key={signal.id} signal={signal} readOnly={isReadOnly} onStatusChange={handleStatusChange} />
+                     ))}
+                   </div>
+                 </div>
+@@ -373,6 +375,7 @@ function formatSignalAge(createdAtStr: string): string {
+ }
+ 
+ interface SignalCardProps {
++  readOnly?: boolean
+   signal: SerializedSignal & {
+     relevanceScore: number
+     posWeight: number
+@@ -383,7 +386,7 @@ interface SignalCardProps {
+   onStatusChange: (id: string, status: 'acknowledged' | 'resolved') => void
+ }
+ 
+-function SignalCard({ signal, onStatusChange }: SignalCardProps) {
++function SignalCard({ signal, readOnly = false, onStatusChange }: SignalCardProps) {
+   const isAcknowledged = signal.status === 'acknowledged'
+   const [isExpanded, setIsExpanded] = useState(!isAcknowledged)
+ 
+@@ -451,7 +454,7 @@ function SignalCard({ signal, onStatusChange }: SignalCardProps) {
+ 
+         {/* Action Controls */}
+         <div className="flex items-center gap-1.5 shrink-0">
+-          {!isExpanded && (
++          {!readOnly && !isExpanded && (
+             <button
+               onClick={() => onStatusChange(signal.id, 'resolved')}
+               className="flex items-center gap-0.5 px-2 py-0.5 bg-[#3b82f6]/10 hover:bg-[#3b82f6]/20 text-[#3b82f6] text-[8px] font-mono font-bold uppercase rounded-sm border border-[#3b82f6]/20 transition-all active:scale-[0.97]"
+@@ -488,7 +491,7 @@ function SignalCard({ signal, onStatusChange }: SignalCardProps) {
+           </div>
+ 
+           {/* Action Buttons to manage Signal State Lifecycle */}
+-          <div className="flex items-center gap-1.5 shrink-0 border-t border-[#1c212a]/30 md:border-0 pt-2 md:pt-0">
++          {!readOnly && <div className="flex items-center gap-1.5 shrink-0 border-t border-[#1c212a]/30 md:border-0 pt-2 md:pt-0">
+             {!isAcknowledged && (
+               <button
+                 onClick={() => onStatusChange(signal.id, 'acknowledged')}
+@@ -507,7 +510,7 @@ function SignalCard({ signal, onStatusChange }: SignalCardProps) {
+               <Check size={10} />
+               Resolve
+             </button>
+-          </div>
++          </div>}
+         </div>
+       )}
+     </div>
+diff --git a/src/components/layout/AppAccessContext.tsx b/src/components/layout/AppAccessContext.tsx
+new file mode 100644
+index 0000000..0b3567d
+--- /dev/null
++++ b/src/components/layout/AppAccessContext.tsx
+@@ -0,0 +1,31 @@
++'use client'
++
++import { createContext, useContext } from 'react'
++
++interface AppAccessContextValue {
++  isAdmin: boolean
++  isReadOnly: boolean
++}
++
++const AppAccessContext = createContext<AppAccessContextValue>({
++  isAdmin: false,
++  isReadOnly: true,
++})
++
++export function AppAccessProvider({
++  isAdmin,
++  children,
++}: {
++  isAdmin: boolean
++  children: React.ReactNode
++}) {
++  return (
++    <AppAccessContext.Provider value={{ isAdmin, isReadOnly: !isAdmin }}>
++      {children}
++    </AppAccessContext.Provider>
++  )
++}
++
++export function useAppAccess() {
++  return useContext(AppAccessContext)
++}
+diff --git a/src/components/layout/BottomNav.tsx b/src/components/layout/BottomNav.tsx
+index edb3b1f..0e3eb9e 100644
+--- a/src/components/layout/BottomNav.tsx
++++ b/src/components/layout/BottomNav.tsx
+@@ -10,30 +10,21 @@ import {
+   Landmark,
+ } from 'lucide-react'
+ 
+-interface Props {
+-  isInvestor?: boolean
+-}
++const NAV_ITEMS = [
++  { href: '/',          label: 'Pool',      icon: Landmark },
++  { href: '/portfolio', label: 'Portfolio', icon: LayoutDashboard },
++  { href: '/add',       label: 'Add',       icon: PlusCircle },
++  { href: '/alerts',    label: 'Alerts',    icon: Bell },
++  { href: '/settings',  label: 'Settings',  icon: Settings },
++]
+ 
+-export function BottomNav({ isInvestor = false }: Props) {
++export function BottomNav() {
+   const pathname = usePathname()
+ 
+-  const navItems = isInvestor
+-    ? [
+-        { href: '/',         label: 'Pool',     icon: Landmark },
+-        { href: '/settings', label: 'Settings', icon: Settings },
+-      ]
+-    : [
+-        { href: '/',          label: 'Pool',      icon: Landmark },
+-        { href: '/portfolio', label: 'Portfolio', icon: LayoutDashboard },
+-        { href: '/add',       label: 'Add',       icon: PlusCircle },
+-        { href: '/alerts',    label: 'Alerts',    icon: Bell },
+-        { href: '/settings',  label: 'Settings',  icon: Settings },
+-      ]
+-
+   return (
+     <nav className="md:hidden fixed bottom-0 left-0 right-0 z-50 glass-panel border-t border-white/[0.08] pb-safe">
+       <div className="flex items-center justify-around px-2 py-2">
+-        {navItems.map(({ href, label, icon: Icon }) => {
++        {NAV_ITEMS.map(({ href, label, icon: Icon }) => {
+           const active = pathname === href || (href !== '/' && pathname.startsWith(href))
+           return (
+             <Link
+diff --git a/src/components/layout/CommandPalette.tsx b/src/components/layout/CommandPalette.tsx
+index 9c2bc17..f30134f 100644
+--- a/src/components/layout/CommandPalette.tsx
++++ b/src/components/layout/CommandPalette.tsx
+@@ -3,11 +3,11 @@
+ import { useState, useEffect, useRef } from 'react'
+ import { useRouter } from 'next/navigation'
+ import { Search } from 'lucide-react'
+-import { usePoolRole } from '@/components/layout/PoolRoleContext'
++import { useAppAccess } from '@/components/layout/AppAccessContext'
+ import { COMMAND_ITEMS } from '@/lib/navigation'
+ 
+ export function CommandPalette() {
+-  const { isInvestor } = usePoolRole()
++  const { isReadOnly } = useAppAccess()
+   const [isOpen, setIsOpen] = useState(false)
+   const [search, setSearch] = useState('')
+   const [activeIndex, setActiveIndex] = useState(0)
+@@ -15,8 +15,8 @@ export function CommandPalette() {
+   const overlayRef = useRef<HTMLDivElement>(null)
+   const inputRef = useRef<HTMLInputElement>(null)
+ 
+-  const commands = isInvestor
+-    ? COMMAND_ITEMS.filter((cmd) => cmd.investor)
++  const commands = isReadOnly
++    ? COMMAND_ITEMS.filter((cmd) => cmd.category === 'Navigation')
+     : COMMAND_ITEMS
+ 
+   useEffect(() => {
+diff --git a/src/components/layout/ReadOnlyBanner.tsx b/src/components/layout/ReadOnlyBanner.tsx
+new file mode 100644
+index 0000000..fda0dd8
+--- /dev/null
++++ b/src/components/layout/ReadOnlyBanner.tsx
+@@ -0,0 +1,19 @@
++'use client'
++
++import { Eye } from 'lucide-react'
++import { useAppAccess } from '@/components/layout/AppAccessContext'
++
++export function ReadOnlyBanner() {
++  const { isReadOnly } = useAppAccess()
++  if (!isReadOnly) return null
++
++  return (
++    <div className="mb-4 flex items-center gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200/90">
++      <Eye size={14} className="shrink-0 text-amber-400" />
++      <span>
++        <strong className="font-semibold">View only</strong> — you can browse everything but cannot make changes.
++        Contact the admin to edit holdings, pool fund, or alerts.
++      </span>
++    </div>
++  )
++}
+diff --git a/src/components/layout/Sidebar.tsx b/src/components/layout/Sidebar.tsx
+index 7f1b53d..1c2d31e 100644
+--- a/src/components/layout/Sidebar.tsx
++++ b/src/components/layout/Sidebar.tsx
+@@ -2,24 +2,20 @@
+ 
+ import Link from 'next/link'
+ import { usePathname } from 'next/navigation'
+-import { Settings } from 'lucide-react'
+ import { ADMIN_NAV } from '@/lib/navigation'
+ 
+ interface SidebarProps {
+   userEmail?: string
+-  isInvestor?: boolean
++  isAdmin?: boolean
+ }
+ 
+-export function Sidebar({ userEmail = 'karthik@stocklens.com', isInvestor = false }: SidebarProps) {
++export function Sidebar({ userEmail = 'karthik@stocklens.com', isAdmin = false }: SidebarProps) {
+   const pathname = usePathname()
+ 
+-  const navItems = isInvestor
+-    ? ADMIN_NAV.filter((item) => item.investor)
+-    : ADMIN_NAV.filter((item) => item.href !== '/settings')
+-
++  const navItems = ADMIN_NAV.filter((item) => item.href !== '/settings')
+   const settingsItem = ADMIN_NAV.find((item) => item.href === '/settings')!
+ 
+-  const renderLink = (href: string, label: string, description: string, Icon: typeof Settings) => {
++  const renderLink = (href: string, label: string, description: string, Icon: typeof settingsItem.icon) => {
+     const active = pathname === href || (href !== '/' && pathname.startsWith(href))
+     return (
+       <Link
+@@ -53,7 +49,7 @@ export function Sidebar({ userEmail = 'karthik@stocklens.com', isInvestor = fals
+             Stock<span className="text-[#60a5fa]">Lens</span>
+           </span>
+           <span className="text-[9px] text-[#64748b] uppercase tracking-widest font-semibold">
+-            {isInvestor ? 'Investor' : 'Portfolio OS'}
++            {isAdmin ? 'Admin' : 'View only'}
+           </span>
+         </div>
+       </div>
+@@ -61,26 +57,22 @@ export function Sidebar({ userEmail = 'karthik@stocklens.com', isInvestor = fals
+       <nav className="flex-1 space-y-4 overflow-y-auto pr-0.5">
+         <div>
+           <div className="px-2.5 mb-2 text-[9px] font-bold text-[#475569] uppercase tracking-[0.14em]">
+-            {isInvestor ? 'Portal' : 'Navigate'}
++            Navigate
+           </div>
+           <div className="space-y-0.5">
+             {navItems.map((item) => renderLink(item.href, item.label, item.description, item.icon))}
+           </div>
+         </div>
+ 
+-        {!isInvestor && (
+-          <>
+-            <div className="h-px bg-gradient-to-r from-transparent via-white/10 to-transparent mx-2" />
+-            <div>
+-              <div className="px-2.5 mb-2 text-[9px] font-bold text-[#475569] uppercase tracking-[0.14em]">
+-                System
+-              </div>
+-              <div className="space-y-0.5">
+-                {renderLink(settingsItem.href, settingsItem.label, settingsItem.description, settingsItem.icon)}
+-              </div>
+-            </div>
+-          </>
+-        )}
++        <div className="h-px bg-gradient-to-r from-transparent via-white/10 to-transparent mx-2" />
++        <div>
++          <div className="px-2.5 mb-2 text-[9px] font-bold text-[#475569] uppercase tracking-[0.14em]">
++            System
++          </div>
++          <div className="space-y-0.5">
++            {renderLink(settingsItem.href, settingsItem.label, settingsItem.description, settingsItem.icon)}
++          </div>
++        </div>
+       </nav>
+ 
+       <div className="mt-auto pt-4 border-t border-white/[0.06]">
+diff --git a/src/components/pool/PoolFundClient.tsx b/src/components/pool/PoolFundClient.tsx
+index 4c68bca..c39ce0a 100644
+--- a/src/components/pool/PoolFundClient.tsx
++++ b/src/components/pool/PoolFundClient.tsx
+@@ -43,6 +43,7 @@ import {
+ import { RefreshCw, LineChart, CheckCircle2, AlertTriangle, Loader2, X, ArrowUpDown, Radio, Pencil, Trash2, Upload, Send } from 'lucide-react'
+ import { toast } from 'sonner'
+ import { PoolDayDetailModal } from '@/components/pool/PoolDayDetailModal'
++import { useAppAccess } from '@/components/layout/AppAccessContext'
+ 
+ interface Props {
+   config: PoolConfig
+@@ -124,6 +125,7 @@ function SortHeader({
+ 
+ export function PoolFundClient({ config, capTable, drafts, published, latestImport, snapshots, assets, investors, transactions }: Props) {
+   const router = useRouter()
++  const { isReadOnly } = useAppAccess()
+   const [isPending, startTransition] = useTransition()
+   const [selectedDraftIds, setSelectedDraftIds] = useState<Set<string>>(new Set())
+ 
+@@ -505,8 +507,8 @@ export function PoolFundClient({ config, capTable, drafts, published, latestImpo
+         </div>
+       )}
+ 
+-      {/* Live sync */}
+-      <div className="card rounded p-4 border border-[#1c212a] bg-[#0b0e14]">
++      {/* Live sync — admin only */}
++      {!isReadOnly && <div className="card rounded p-4 border border-[#1c212a] bg-[#0b0e14]">
+         <div className="flex items-center gap-2 mb-3">
+           <Radio size={14} className="text-[#22c55e]" />
+           <h2 className="text-[11px] font-bold uppercase tracking-wider text-[#94a3b8]">Angel One Live NAV</h2>
+@@ -577,9 +579,9 @@ export function PoolFundClient({ config, capTable, drafts, published, latestImpo
+             {latestImport.created_at ? ` · ${new Date(latestImport.created_at).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit' })} IST` : ''}
+           </p>
+         )}
+-      </div>
++      </div>}
+ 
+-      <div className="card rounded p-4 border border-[#1c212a] bg-[#0b0e14]">
++      {!isReadOnly && <div className="card rounded p-4 border border-[#1c212a] bg-[#0b0e14]">
+         <div className="flex items-center gap-2 mb-2">
+           <Upload size={14} className="text-[#a78bfa]" />
+           <h2 className="text-[11px] font-bold uppercase tracking-wider text-[#94a3b8]">Historical Excel Import</h2>
+@@ -601,9 +603,9 @@ export function PoolFundClient({ config, capTable, drafts, published, latestImpo
+         {importWarnings.length > 0 && (
+           <p className="text-[10px] text-[#f59e0b] mt-2">{importWarnings.length} import warnings — check server logs</p>
+         )}
+-      </div>
++      </div>}
+ 
+-      <PoolAssetsPanel assets={assets} disabled={isPending} />
++      <PoolAssetsPanel assets={assets} disabled={isPending || isReadOnly} />
+ 
+       <PoolSettingsPanel config={config} />
+ 
+@@ -674,7 +676,7 @@ export function PoolFundClient({ config, capTable, drafts, published, latestImpo
+             <h2 className="text-[11px] font-bold uppercase tracking-wider text-[#94a3b8]">
+               NAV ({filteredNavRows.length} days)
+             </h2>
+-            {draftRowsInView.length > 0 && (
++            {!isReadOnly && draftRowsInView.length > 0 && (
+               <div className="flex gap-2">
+                 <button
+                   type="button"
+@@ -737,7 +739,7 @@ export function PoolFundClient({ config, capTable, drafts, published, latestImpo
+                     onClick={() => openDayDetail(row.isoDate, row.dateLabel)}
+                   >
+                     <td className="py-1.5 px-2" onClick={(e) => e.stopPropagation()}>
+-                      {row.status === 'draft' && (
++                      {!isReadOnly && row.status === 'draft' && (
+                         <input
+                           type="checkbox"
+                           checked={selectedDraftIds.has(row.id)}
+@@ -756,7 +758,7 @@ export function PoolFundClient({ config, capTable, drafts, published, latestImpo
+                       {row.adminOverride && (
+                         <span className="ml-1 text-[9px] text-[#f59e0b] uppercase font-bold">override</span>
+                       )}
+-                      {row.status === 'published' && (
++                      {!isReadOnly && row.status === 'published' && (
+                         <>
+                           <button
+                             type="button"
+diff --git a/src/components/pool/PoolInvestorsPanel.tsx b/src/components/pool/PoolInvestorsPanel.tsx
+index 4c30e17..d41c8ed 100644
+--- a/src/components/pool/PoolInvestorsPanel.tsx
++++ b/src/components/pool/PoolInvestorsPanel.tsx
+@@ -7,6 +7,7 @@ import type { PoolInvestor } from '@/server/db/schema'
+ import { MAX_POOL_INVESTORS } from '@/utils/poolAssetLabels'
+ import { Loader2, Mail, UserPlus, UserX } from 'lucide-react'
+ import { toast } from 'sonner'
++import { useAppAccess } from '@/components/layout/AppAccessContext'
+ 
+ interface Props {
+   investors: PoolInvestor[]
+@@ -14,6 +15,7 @@ interface Props {
+ 
+ export function PoolInvestorsPanel({ investors }: Props) {
+   const router = useRouter()
++  const { isReadOnly } = useAppAccess()
+   const [isPending, startTransition] = useTransition()
+   const [email, setEmail] = useState('')
+   const [name, setName] = useState('')
+@@ -59,7 +61,7 @@ export function PoolInvestorsPanel({ investors }: Props) {
+         Email invite for read-only portal access. Family and friends only.
+       </p>
+ 
+-      {activeCount < MAX_POOL_INVESTORS && (
++      {!isReadOnly && activeCount < MAX_POOL_INVESTORS && (
+         <div className="flex flex-col sm:flex-row gap-2 mb-3">
+           <input
+             type="email"
+@@ -107,7 +109,7 @@ export function PoolInvestorsPanel({ investors }: Props) {
+                 }`}>
+                   {inv.status}
+                 </span>
+-                {inv.status !== 'revoked' && (
++                {!isReadOnly && inv.status !== 'revoked' && (
+                   <button
+                     type="button"
+                     disabled={isPending}
+diff --git a/src/components/pool/PoolSettingsPanel.tsx b/src/components/pool/PoolSettingsPanel.tsx
+index fb3fdda..915929b 100644
+--- a/src/components/pool/PoolSettingsPanel.tsx
++++ b/src/components/pool/PoolSettingsPanel.tsx
+@@ -6,6 +6,7 @@ import { savePoolConfigAction } from '@/features/pool/actions'
+ import type { PoolConfig } from '@/server/db/schema'
+ import { Loader2, Settings2 } from 'lucide-react'
+ import { toast } from 'sonner'
++import { useAppAccess } from '@/components/layout/AppAccessContext'
+ 
+ interface Props {
+   config: PoolConfig
+@@ -13,6 +14,7 @@ interface Props {
+ 
+ export function PoolSettingsPanel({ config }: Props) {
+   const router = useRouter()
++  const { isReadOnly } = useAppAccess()
+   const [isPending, startTransition] = useTransition()
+   const [name, setName] = useState(config.name)
+   const [baseNav, setBaseNav] = useState(String(Number(config.base_nav)))
+@@ -45,7 +47,8 @@ export function PoolSettingsPanel({ config }: Props) {
+           <input
+             value={name}
+             onChange={(e) => setName(e.target.value)}
+-            className="w-full bg-[#070a0d] border border-[#1c212a] rounded px-2 py-1.5 text-[11px] text-[#e2e8f0]"
++            readOnly={isReadOnly}
++            className="w-full bg-[#070a0d] border border-[#1c212a] rounded px-2 py-1.5 text-[11px] text-[#e2e8f0] disabled:opacity-70"
+           />
+         </div>
+         <div>
+@@ -69,15 +72,17 @@ export function PoolSettingsPanel({ config }: Props) {
+           Inception: {new Date(config.inception_date).toLocaleDateString('en-IN')}
+         </p>
+       )}
+-      <button
+-        type="button"
+-        onClick={handleSave}
+-        disabled={isPending}
+-        className="px-3 py-1.5 rounded border border-[#1c212a] text-[#e2e8f0] text-[11px] font-semibold hover:bg-[#ffffff08] disabled:opacity-50 flex items-center gap-1"
+-      >
+-        {isPending && <Loader2 size={12} className="animate-spin" />}
+-        Save settings
+-      </button>
++      {!isReadOnly && (
++        <button
++          type="button"
++          onClick={handleSave}
++          disabled={isPending}
++          className="px-3 py-1.5 rounded border border-[#1c212a] text-[#e2e8f0] text-[11px] font-semibold hover:bg-[#ffffff08] disabled:opacity-50 flex items-center gap-1"
++        >
++          {isPending && <Loader2 size={12} className="animate-spin" />}
++          Save settings
++        </button>
++      )}
+     </div>
+   )
+ }
+diff --git a/src/components/stock/StockDetailClient.tsx b/src/components/stock/StockDetailClient.tsx
+index a0aec3f..1128c4c 100644
+--- a/src/components/stock/StockDetailClient.tsx
++++ b/src/components/stock/StockDetailClient.tsx
+@@ -23,6 +23,7 @@ import {
+   deleteHoldingAction,
+ } from '@/features/holdings/detailActions'
+ import type { Holding, Alert, QuarterlyUpdate, ResearchDocument } from '@/server/db/schema'
++import { useAppAccess } from '@/components/layout/AppAccessContext'
+ import { QuarterlyTab } from './QuarterlyTab'
+ import { ResearchTab } from './ResearchTab'
+ import { FactorScoreCard } from './FactorScoreCard'
+@@ -495,6 +496,7 @@ interface Props {
+ export function StockDetailClient({ holding, initialQuarterly, initialAlerts, initialResearchDocs, factorScore, latestRegime }: Props) {
+   const router = useRouter()
+   const queryClient = useQueryClient()
++  const { isReadOnly } = useAppAccess()
+   const [currentHolding, setCurrentHolding] = useState<Holding>(holding)
+   const [showEdit, setShowEdit] = useState(false)
+   const [tab, setTab]                   = useState<'thesis' | 'quarterly' | 'alerts' | 'research'>('thesis')
+@@ -621,20 +623,22 @@ export function StockDetailClient({ holding, initialQuarterly, initialAlerts, in
+                 </span>
+               </div>
+             </div>
+-            <div className="flex items-center gap-2 shrink-0">
+-              <button
+-                onClick={() => setShowEdit(true)}
+-                className="px-3 py-1.5 text-xs bg-[#1e293b] text-[#94a3b8] border border-[#2a2a2a] rounded-sm hover:bg-[#2a2a2a] hover:text-white transition-colors shrink-0"
+-              >
+-                Edit Details
+-              </button>
+-              <button
+-                onClick={() => setShowSell(true)}
+-                className="px-3 py-1.5 text-xs bg-[#3b0a0a] text-[#ef4444] border border-[#ef4444]/30 rounded-sm hover:bg-[#ef4444]/10 transition-colors shrink-0"
+-              >
+-                Sell Stock
+-              </button>
+-            </div>
++            {!isReadOnly && (
++              <div className="flex items-center gap-2 shrink-0">
++                <button
++                  onClick={() => setShowEdit(true)}
++                  className="px-3 py-1.5 text-xs bg-[#1e293b] text-[#94a3b8] border border-[#2a2a2a] rounded-sm hover:bg-[#2a2a2a] hover:text-white transition-colors shrink-0"
++                >
++                  Edit Details
++                </button>
++                <button
++                  onClick={() => setShowSell(true)}
++                  className="px-3 py-1.5 text-xs bg-[#3b0a0a] text-[#ef4444] border border-[#ef4444]/30 rounded-sm hover:bg-[#ef4444]/10 transition-colors shrink-0"
++                >
++                  Sell Stock
++                </button>
++              </div>
++            )}
+           </div>
+ 
+           <div className="grid grid-cols-3 gap-3 text-sm">
+@@ -704,21 +708,22 @@ export function StockDetailClient({ holding, initialQuarterly, initialAlerts, in
+           <form onSubmit={handleSubmit(onSaveThesis)} className="bg-[#1a1a1a] border border-[#2a2a2a] rounded-sm p-5 space-y-4">
+             <div>
+               <label className="block text-xs text-[#94a3b8] mb-1">Buy Thesis *</label>
+-              <textarea rows={5} {...register('buy_thesis')} className={inputCls} />
++              <textarea rows={5} readOnly={isReadOnly} {...register('buy_thesis')} className={inputCls} />
+               {errors.buy_thesis && <p className="text-xs text-[#ef4444] mt-1">{errors.buy_thesis.message}</p>}
+             </div>
+             <div>
+               <label className="block text-xs text-[#94a3b8] mb-1">Exit Thesis *</label>
+-              <textarea rows={5} {...register('exit_thesis')} className={inputCls} />
++              <textarea rows={5} readOnly={isReadOnly} {...register('exit_thesis')} className={inputCls} />
+               {errors.exit_thesis && <p className="text-xs text-[#ef4444] mt-1">{errors.exit_thesis.message}</p>}
+             </div>
+             <div>
+               <label className="block text-xs text-[#94a3b8] mb-1">
+                 Conviction — <ConvictionLabel score={conviction ?? 5} />
+               </label>
+-              <input type="range" min={1} max={10} step={1} {...register('conviction_score', { valueAsNumber: true })} className="w-full accent-[#22c55e]" />
++              <input type="range" min={1} max={10} step={1} disabled={isReadOnly} {...register('conviction_score', { valueAsNumber: true })} className="w-full accent-[#22c55e]" />
+             </div>
+             <div className="flex items-center gap-4 flex-wrap">
++              {!isReadOnly && (
+               <div className="flex gap-3">
+                 <button
+                   type="submit"
+@@ -735,6 +740,7 @@ export function StockDetailClient({ holding, initialQuarterly, initialAlerts, in
+                   ✓ Mark as Reviewed
+                 </button>
+               </div>
++              )}
+               {daysSinceThesisUpdate !== null && (
+                 <span className="text-xs text-[#64748b]">
+                   Thesis updated{' '}
+diff --git a/src/components/watchlist/WatchlistClient.tsx b/src/components/watchlist/WatchlistClient.tsx
+index b2ae46b..c4e7c55 100644
+--- a/src/components/watchlist/WatchlistClient.tsx
++++ b/src/components/watchlist/WatchlistClient.tsx
+@@ -13,6 +13,7 @@ import {
+   deleteWatchlistItemAction,
+ } from '@/features/watchlist/actions'
+ import { Bookmark, Plus, Trash2, ArrowRight, Loader2 } from 'lucide-react'
++import { useAppAccess } from '@/components/layout/AppAccessContext'
+ 
+ const watchlistSchema = z.object({
+   ticker:           z.string().min(1, 'Ticker is required'),
+@@ -29,6 +30,7 @@ interface Props {
+ 
+ export function WatchlistClient({ initialItems }: Props) {
+   const router = useRouter()
++  const { isReadOnly } = useAppAccess()
+   const [items, setItems] = useState<WatchlistItem[]>(initialItems)
+ 
+   const {
+@@ -101,7 +103,7 @@ export function WatchlistClient({ initialItems }: Props) {
+       </div>
+ 
+       <div className="grid grid-cols-1 lg:grid-cols-[minmax(280px,340px)_1fr] gap-5 items-start">
+-        <div className="form-panel">
++        {!isReadOnly && <div className="form-panel">
+           <div>
+             <h2 className="form-section-title flex items-center gap-2">
+               <Bookmark size={16} className="text-[#60a5fa]" />
+@@ -159,7 +161,7 @@ export function WatchlistClient({ initialItems }: Props) {
+               )}
+             </button>
+           </form>
+-        </div>
++        </div>}
+ 
+         <div className="analytics-panel flex flex-col min-h-[320px]">
+           <div className="flex items-center justify-between gap-3 mb-4">
+@@ -210,26 +212,30 @@ export function WatchlistClient({ initialItems }: Props) {
+                         </td>
+                         <td className="text-right">
+                           <div className="flex items-center justify-end gap-1.5">
+-                            <button
+-                              type="button"
+-                              onClick={() => {
+-                                router.push(
+-                                  `/add?ticker=${item.ticker}&company=${encodeURIComponent(item.company_name)}&price=${price ?? ''}`,
+-                                )
+-                              }}
+-                              title="Add to portfolio"
+-                              className="btn-ghost py-1.5 px-2.5 text-[#93c5fd] border-[#3b82f6]/20"
+-                            >
+-                              Buy <ArrowRight size={12} />
+-                            </button>
+-                            <button
+-                              type="button"
+-                              onClick={() => handleDelete(item.id, item.ticker)}
+-                              title="Remove"
+-                              className="holdings-clear-btn py-1.5 px-2 text-[#94a3b8] hover:text-[#fb7185]"
+-                            >
+-                              <Trash2 size={14} />
+-                            </button>
++                            {!isReadOnly && (
++                              <>
++                                <button
++                                  type="button"
++                                  onClick={() => {
++                                    router.push(
++                                      `/add?ticker=${item.ticker}&company=${encodeURIComponent(item.company_name)}&price=${price ?? ''}`,
++                                    )
++                                  }}
++                                  title="Add to portfolio"
++                                  className="btn-ghost py-1.5 px-2.5 text-[#93c5fd] border-[#3b82f6]/20"
++                                >
++                                  Buy <ArrowRight size={12} />
++                                </button>
++                                <button
++                                  type="button"
++                                  onClick={() => handleDelete(item.id, item.ticker)}
++                                  title="Remove"
++                                  className="holdings-clear-btn py-1.5 px-2 text-[#94a3b8] hover:text-[#fb7185]"
++                                >
++                                  <Trash2 size={14} />
++                                </button>
++                              </>
++                            )}
+                           </div>
+                         </td>
+                       </tr>
+diff --git a/src/features/alerts/actions.ts b/src/features/alerts/actions.ts
+index 55a6199..f4013ee 100644
+--- a/src/features/alerts/actions.ts
++++ b/src/features/alerts/actions.ts
+@@ -4,14 +4,14 @@ import { db } from '@/server/db'
+ import { signalEvents } from '@/server/db/schema'
+ import { eq } from 'drizzle-orm'
+ import { revalidatePath } from 'next/cache'
+-import { getAuthenticatedUserId } from '@/server/db/supabase'
++import { requireAdmin } from '@/server/auth/appAccess'
+ 
+ export async function updateSignalStatusAction(
+   id: string,
+   status: 'acknowledged' | 'resolved' | 'suppressed'
+ ): Promise<{ success: boolean; error?: string }> {
+   try {
+-    await getAuthenticatedUserId()
++    await requireAdmin()
+ 
+     await db
+       .update(signalEvents)
+diff --git a/src/features/auth/LoginForm.tsx b/src/features/auth/LoginForm.tsx
+index 862b564..e1b3a19 100644
+--- a/src/features/auth/LoginForm.tsx
++++ b/src/features/auth/LoginForm.tsx
+@@ -7,7 +7,11 @@ import Link from 'next/link'
+ import { loginSchema, type LoginFormValues } from './schemas'
+ import { loginAction } from './actions'
+ 
+-export function LoginForm() {
++interface Props {
++  signupOpen?: boolean
++}
++
++export function LoginForm({ signupOpen = false }: Props) {
+   const {
+     register,
+     handleSubmit,
+@@ -65,13 +69,14 @@ export function LoginForm() {
+         {isSubmitting ? 'Signing in…' : 'Sign in'}
+       </button>
+ 
+-      <p className="text-center text-sm text-[#94a3b8]">
+-        No account?{' '}
+-        <Link href="/signup" className="text-[#22c55e] hover:underline">
+-          Sign up
+-        </Link>
+-      </p>
++      {signupOpen && (
++        <p className="text-center text-sm text-[#94a3b8]">
++          No account?{' '}
++          <Link href="/signup" className="text-[#22c55e] hover:underline">
++            Sign up
++          </Link>
++        </p>
++      )}
+     </form>
+   )
+ }
+-
+diff --git a/src/features/auth/actions.ts b/src/features/auth/actions.ts
+index f3bd853..4064725 100644
+--- a/src/features/auth/actions.ts
++++ b/src/features/auth/actions.ts
+@@ -1,6 +1,7 @@
+ 'use server'
+ 
+ import { redirect } from 'next/navigation'
++import { isPublicSignupAllowed } from '@/server/auth/appAccess'
+ import { createSupabaseServerClient } from '@/server/db/supabase'
+ import type { LoginFormValues, SignupFormValues } from './schemas'
+ 
+@@ -19,6 +20,9 @@ export async function loginAction(values: LoginFormValues): Promise<{ error?: st
+ }
+ 
+ export async function signupAction(values: SignupFormValues): Promise<{ error?: string }> {
++  if (!isPublicSignupAllowed()) {
++    return { error: 'Registration is closed. Contact the admin for an invite.' }
++  }
+   try {
+     const supabase = createSupabaseServerClient()
+     const domain = process.env.RAILWAY_PUBLIC_DOMAIN
+diff --git a/src/features/export/actions.ts b/src/features/export/actions.ts
+index 670b008..04b50be 100644
+--- a/src/features/export/actions.ts
++++ b/src/features/export/actions.ts
+@@ -1,5 +1,6 @@
+ 'use server'
+ 
++import { requireAdmin } from '@/server/auth/appAccess'
+ import { getHoldings, getExitedHoldings } from '@/server/repositories/holdingsRepository'
+ import { getAllQuarterlyUpdatesUser } from '@/server/repositories/quarterlyRepository'
+ 
+@@ -14,6 +15,7 @@ function escapeCSV(val: unknown): string {
+ 
+ export async function exportHoldingsAction(): Promise<{ success: boolean; data?: string; error?: string }> {
+   try {
++    await requireAdmin()
+     const active = await getHoldings()
+     const headers = ['Ticker', 'Company Name', 'Buy Price (INR)', 'Quantity', 'Entry Date', 'Conviction Score', 'Source', 'Alerts Enabled']
+     const rows = active.map((h) => [
+@@ -36,6 +38,7 @@ export async function exportHoldingsAction(): Promise<{ success: boolean; data?:
+ 
+ export async function exportQuarterlyUpdatesAction(): Promise<{ success: boolean; data?: string; error?: string }> {
+   try {
++    await requireAdmin()
+     const updates = await getAllQuarterlyUpdatesUser()
+     const headers = ['Quarter', 'Year', 'Revenue (INR Cr)', 'Net Profit (INR Cr)', 'Filed Date', 'Key Positives', 'Key Negatives', 'Management Guidance', 'Red Flags', 'Analyst Take']
+     const rows = updates.map((u) => [
+@@ -60,6 +63,7 @@ export async function exportQuarterlyUpdatesAction(): Promise<{ success: boolean
+ 
+ export async function exportSellHistoryAction(): Promise<{ success: boolean; data?: string; error?: string }> {
+   try {
++    await requireAdmin()
+     const exited = await getExitedHoldings()
+     const headers = ['Ticker', 'Company Name', 'Source', 'Entry Price (INR)', 'Exit Price (INR)', 'Hold Period (Days)', 'Return %', 'Sell Reason', 'Sell Date']
+     const rows = exited.map(({ sellLog: s, holding: h }) => {
+diff --git a/src/features/holdings/actions.ts b/src/features/holdings/actions.ts
+index f4c8ea7..a6f17e2 100644
+--- a/src/features/holdings/actions.ts
++++ b/src/features/holdings/actions.ts
+@@ -4,6 +4,7 @@ import { createHolding } from '@/server/repositories/holdingsRepository'
+ import { fetchSector } from '@/services/brokers/yahooFallback'
+ import { db } from '@/server/db'
+ import { holdings as holdingsTable } from '@/server/db/schema'
++import { requireAdmin } from '@/server/auth/appAccess'
+ import { getAuthenticatedUserId } from '@/server/db/supabase'
+ import { inArray, and, eq } from 'drizzle-orm'
+ import type { AddHoldingValues } from './schemas'
+@@ -12,6 +13,7 @@ export async function addHoldingAction(
+   values: AddHoldingValues
+ ): Promise<{ error?: string }> {
+   try {
++    await requireAdmin()
+     await createHolding({
+       ticker:           values.ticker.toUpperCase(),
+       company_name:     values.company_name,
+@@ -40,6 +42,7 @@ export async function addHoldingAction(
+ 
+ export async function enrichHoldingSectorAction(ticker: string): Promise<void> {
+   try {
++    await requireAdmin()
+     const sector = await fetchSector(ticker)
+     if (!sector) return
+ 
+@@ -61,6 +64,7 @@ export async function bulkImportHoldingsAction(
+   }>
+ ): Promise<{ success: boolean; inserted: number; skipped: number; error?: string }> {
+   try {
++    await requireAdmin()
+     const userId = await getAuthenticatedUserId()
+     const today = new Date()
+ 
+diff --git a/src/features/holdings/detailActions.ts b/src/features/holdings/detailActions.ts
+index 26c9449..31a3c67 100644
+--- a/src/features/holdings/detailActions.ts
++++ b/src/features/holdings/detailActions.ts
+@@ -3,7 +3,7 @@
+ import { updateHolding, getHoldingById, updateAlertsEnabled, deleteHolding } from '@/server/repositories/holdingsRepository'
+ import { db } from '@/server/db'
+ import { sellLog } from '@/server/db/schema'
+-import { getAuthenticatedUserId } from '@/server/db/supabase'
++import { getDataUserId, requireAdmin } from '@/server/auth/appAccess'
+ import { calculateReturnPct } from '@/utils/finance'
+ import { writeAudit } from '@/lib/audit'
+ 
+@@ -12,6 +12,7 @@ export async function updateThesisAction(
+   values: { buy_thesis: string; exit_thesis: string; conviction_score: number }
+ ): Promise<{ error?: string }> {
+   try {
++    await requireAdmin()
+     await updateHolding(holdingId, {
+       buy_thesis:       values.buy_thesis,
+       exit_thesis:      values.exit_thesis,
+@@ -30,6 +31,7 @@ export async function updateThesisAction(
+ 
+ export async function markReviewedAction(holdingId: string): Promise<{ error?: string }> {
+   try {
++    await requireAdmin()
+     await updateHolding(holdingId, { last_reviewed_at: new Date() })
+     await writeAudit('manual_action', `Holding ${holdingId} marked as reviewed`, { holdingId })
+     return {}
+@@ -43,7 +45,8 @@ export async function sellHoldingAction(
+   values: { sell_price: number; sell_date: string; sell_reason: string }
+ ): Promise<{ error?: string }> {
+   try {
+-    const userId  = await getAuthenticatedUserId()
++    await requireAdmin()
++    const userId  = await getDataUserId()
+     const holding = await getHoldingById(holdingId)
+     if (!holding) return { error: 'Holding not found' }
+ 
+@@ -74,6 +77,7 @@ export async function toggleAlertsAction(
+   enabled: boolean
+ ): Promise<{ success: boolean; error?: string }> {
+   try {
++    await requireAdmin()
+     const updated = await updateAlertsEnabled(holdingId, enabled)
+     if (!updated) return { success: false, error: 'Holding not found or unauthorized' }
+     return { success: true }
+@@ -98,6 +102,7 @@ export async function editHoldingAction(
+   }
+ ): Promise<{ success: boolean; error?: string }> {
+   try {
++    await requireAdmin()
+     const updated = await updateHolding(holdingId, {
+       ticker:           values.ticker.toUpperCase(),
+       company_name:     values.company_name,
+@@ -119,6 +124,7 @@ export async function editHoldingAction(
+ 
+ export async function deleteHoldingAction(holdingId: string): Promise<{ success: boolean; error?: string }> {
+   try {
++    await requireAdmin()
+     await deleteHolding(holdingId)
+     return { success: true }
+   } catch (err) {
+diff --git a/src/features/quarterly/actions.ts b/src/features/quarterly/actions.ts
+index 0d5eea1..22f0831 100644
+--- a/src/features/quarterly/actions.ts
++++ b/src/features/quarterly/actions.ts
+@@ -1,5 +1,6 @@
+ 'use server'
+ 
++import { requireAdmin } from '@/server/auth/appAccess'
+ import {
+   createQuarterlyUpdate,
+   getQuarterlyUpdateForHoldingAndPeriod,
+@@ -13,6 +14,7 @@ export async function addQuarterlyAction(
+   values: AddQuarterlyValues
+ ): Promise<{ error?: string }> {
+   try {
++    await requireAdmin()
+     // Duplicate Quarter Check
+     const existing = await getQuarterlyUpdateForHoldingAndPeriod(
+       holdingId,
+@@ -60,6 +62,7 @@ export async function editQuarterlyAction(
+   values: AddQuarterlyValues
+ ): Promise<{ error?: string }> {
+   try {
++    await requireAdmin()
+     // Parse and validate structured JSON
+     let parsed: ReturnType<typeof structuredSchema.parse>
+     try {
+@@ -93,6 +96,7 @@ export async function editQuarterlyAction(
+ 
+ export async function deleteQuarterlyAction(id: string): Promise<{ error?: string }> {
+   try {
++    await requireAdmin()
+     await deleteQuarterlyUpdate(id)
+     return {}
+   } catch (err) {
+diff --git a/src/features/research/actions.ts b/src/features/research/actions.ts
+index d5a04ea..2941c20 100644
+--- a/src/features/research/actions.ts
++++ b/src/features/research/actions.ts
+@@ -1,5 +1,6 @@
+ 'use server'
+ 
++import { requireAdmin } from '@/server/auth/appAccess'
+ import { addResearchDocument, deleteResearchDocument } from '@/server/repositories/researchRepository'
+ import { revalidatePath } from 'next/cache'
+ 
+@@ -11,6 +12,7 @@ export async function addResearchDocumentAction(data: {
+   notes?: string
+ }): Promise<{ success: boolean; error?: string }> {
+   try {
++    await requireAdmin()
+     await addResearchDocument({
+       holding_id: data.holding_id,
+       title:      data.title.trim(),
+@@ -27,6 +29,7 @@ export async function addResearchDocumentAction(data: {
+ 
+ export async function deleteResearchDocumentAction(id: string): Promise<{ success: boolean; error?: string }> {
+   try {
++    await requireAdmin()
+     await deleteResearchDocument(id)
+     revalidatePath('/stock')
+     return { success: true }
+diff --git a/src/features/watchlist/actions.ts b/src/features/watchlist/actions.ts
+index 05cdbde..61c7bb1 100644
+--- a/src/features/watchlist/actions.ts
++++ b/src/features/watchlist/actions.ts
+@@ -1,5 +1,6 @@
+ 'use server'
+ 
++import { requireAdmin } from '@/server/auth/appAccess'
+ import { createWatchlistItem, deleteWatchlistItem } from '@/server/repositories/watchlistRepository'
+ import { revalidatePath } from 'next/cache'
+ 
+@@ -10,6 +11,7 @@ export async function addWatchlistItemAction(values: {
+   target_buy_price?: number
+ }): Promise<{ success: boolean; error?: string }> {
+   try {
++    await requireAdmin()
+     await createWatchlistItem({
+       ticker:           values.ticker.toUpperCase().trim(),
+       company_name:     values.company_name.trim(),
+@@ -25,6 +27,7 @@ export async function addWatchlistItemAction(values: {
+ 
+ export async function deleteWatchlistItemAction(id: string): Promise<{ success: boolean; error?: string }> {
+   try {
++    await requireAdmin()
+     await deleteWatchlistItem(id)
+     revalidatePath('/watchlist')
+     return { success: true }
+diff --git a/src/server/auth/appAccess.ts b/src/server/auth/appAccess.ts
+new file mode 100644
+index 0000000..c4ce606
+--- /dev/null
++++ b/src/server/auth/appAccess.ts
+@@ -0,0 +1,71 @@
++import 'server-only'
++
++import { eq } from 'drizzle-orm'
++import { db } from '@/server/db'
++import { userSettings } from '@/server/db/schema'
++import { getAuthenticatedUserId } from '@/server/db/supabase'
++
++let cachedAdminUserId: string | null | undefined
++
++export async function getAdminUserId(): Promise<string | null> {
++  if (cachedAdminUserId !== undefined) return cachedAdminUserId
++
++  const [row] = await db
++    .select({ user_id: userSettings.user_id })
++    .from(userSettings)
++    .where(eq(userSettings.is_admin, true))
++    .limit(1)
++
++  cachedAdminUserId = row?.user_id ?? null
++  return cachedAdminUserId
++}
++
++export async function isUserAdmin(userId: string): Promise<boolean> {
++  const [row] = await db
++    .select({ is_admin: userSettings.is_admin })
++    .from(userSettings)
++    .where(eq(userSettings.user_id, userId))
++    .limit(1)
++
++  return row?.is_admin ?? false
++}
++
++export async function getIsAdmin(): Promise<boolean> {
++  const userId = await getAuthenticatedUserId()
++  return isUserAdmin(userId)
++}
++
++export async function requireAdmin(): Promise<void> {
++  if (!(await getIsAdmin())) {
++    throw new Error('Admin access required')
++  }
++}
++
++/** Portfolio/pool data owner — admin's account for read-only users. */
++export async function getDataUserId(): Promise<string> {
++  const userId = await getAuthenticatedUserId()
++  if (await isUserAdmin(userId)) return userId
++
++  const adminId = await getAdminUserId()
++  return adminId ?? userId
++}
++
++/** Promote ADMIN_EMAIL user to admin on login (set ADMIN_EMAIL in Railway). */
++export async function ensureAdminOnLogin(userId: string, email: string): Promise<void> {
++  const adminEmail = process.env.ADMIN_EMAIL?.trim().toLowerCase()
++  if (!adminEmail || email.trim().toLowerCase() !== adminEmail) return
++
++  await db
++    .insert(userSettings)
++    .values({ user_id: userId, is_admin: true })
++    .onConflictDoUpdate({
++      target: userSettings.user_id,
++      set: { is_admin: true },
++    })
++
++  cachedAdminUserId = userId
++}
++
++export function isPublicSignupAllowed(): boolean {
++  return process.env.ALLOW_PUBLIC_SIGNUP === 'true'
++}
+diff --git a/src/server/auth/poolAccess.ts b/src/server/auth/poolAccess.ts
+index 0df33bb..6e8d171 100644
+--- a/src/server/auth/poolAccess.ts
++++ b/src/server/auth/poolAccess.ts
+@@ -71,10 +71,8 @@ export async function activateInvestorOnLogin(userId: string, email: string) {
+     )
+ }
+ 
+-export async function requirePoolAdmin(userId: string): Promise<string> {
+-  const access = await getPoolAccess(userId)
+-  if (access.role !== 'admin') {
+-    throw new Error('Pool admin access required')
+-  }
+-  return access.poolUserId
++export async function requirePoolAdmin(_userId?: string): Promise<string> {
++  const { requireAdmin, getDataUserId } = await import('@/server/auth/appAccess')
++  await requireAdmin()
++  return getDataUserId()
+ }
+diff --git a/src/server/db/schema.ts b/src/server/db/schema.ts
+index 075ec77..0d3f21d 100644
+--- a/src/server/db/schema.ts
++++ b/src/server/db/schema.ts
+@@ -267,6 +267,7 @@ export const userSettings = pgTable(
+   {
+     id:                uuid('id').defaultRandom().primaryKey(),
+     user_id:           uuid('user_id').notNull().unique(),
++    is_admin:          boolean('is_admin').notNull().default(false),
+     telegram_chat_id:  text('telegram_chat_id'),
+     created_at:        timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+   },
+diff --git a/src/server/repositories/alertsRepository.ts b/src/server/repositories/alertsRepository.ts
+index 57c1954..4fff5fc 100644
+--- a/src/server/repositories/alertsRepository.ts
++++ b/src/server/repositories/alertsRepository.ts
+@@ -5,16 +5,16 @@
+ import { eq, and, isNull, isNotNull, desc } from 'drizzle-orm'
+ import { db } from '@/server/db'
+ import { alerts, holdings } from '@/server/db/schema'
+-import { getAuthenticatedUserId } from '@/server/db/supabase'
++import { getDataUserId } from '@/server/auth/appAccess'
+ import type { Alert, NewAlert, Holding } from '@/server/db/schema'
+ 
+ export async function getAlerts(): Promise<Alert[]> {
+-  const userId = await getAuthenticatedUserId()
++  const userId = await getDataUserId()
+   return db.select().from(alerts).where(eq(alerts.user_id, userId))
+ }
+ 
+ export async function getUntriggeredAlerts(): Promise<Alert[]> {
+-  const userId = await getAuthenticatedUserId()
++  const userId = await getDataUserId()
+   return db
+     .select()
+     .from(alerts)
+@@ -22,7 +22,7 @@ export async function getUntriggeredAlerts(): Promise<Alert[]> {
+ }
+ 
+ export async function createAlert(data: Omit<NewAlert, 'user_id'>): Promise<Alert> {
+-  const userId = await getAuthenticatedUserId()
++  const userId = await getDataUserId()
+   const rows = await db
+     .insert(alerts)
+     .values({ ...data, user_id: userId })
+@@ -62,7 +62,7 @@ export async function getLatestAlertForHoldingService(holdingId: string): Promis
+ }
+ 
+ export async function getAlertsForHolding(holdingId: string): Promise<Alert[]> {
+-  const userId = await getAuthenticatedUserId()
++  const userId = await getDataUserId()
+   return db
+     .select()
+     .from(alerts)
+@@ -71,7 +71,7 @@ export async function getAlertsForHolding(holdingId: string): Promise<Alert[]> {
+ }
+ 
+ export async function getAllTriggeredAlerts(): Promise<Alert[]> {
+-  const userId = await getAuthenticatedUserId()
++  const userId = await getDataUserId()
+   return db
+     .select()
+     .from(alerts)
+@@ -97,7 +97,7 @@ export async function markAlertTriggered(
+ }
+ 
+ export async function deleteAlert(id: string): Promise<void> {
+-  const userId = await getAuthenticatedUserId()
++  const userId = await getDataUserId()
+   await db
+     .delete(alerts)
+     .where(and(eq(alerts.id, id), eq(alerts.user_id, userId)))
+diff --git a/src/server/repositories/holdingsRepository.ts b/src/server/repositories/holdingsRepository.ts
+index 717fbe2..09b1791 100644
+--- a/src/server/repositories/holdingsRepository.ts
++++ b/src/server/repositories/holdingsRepository.ts
+@@ -1,11 +1,11 @@
+ import { eq, and, desc } from 'drizzle-orm'
+ import { db } from '@/server/db'
+ import { holdings, portfolioSnapshots, sellLog } from '@/server/db/schema'
+-import { getAuthenticatedUserId } from '@/server/db/supabase'
++import { getDataUserId } from '@/server/auth/appAccess'
+ import type { Holding, NewHolding, PortfolioSnapshot } from '@/server/db/schema'
+ 
+ export async function getHoldings(): Promise<Holding[]> {
+-  const userId = await getAuthenticatedUserId()
++  const userId = await getDataUserId()
+   return db
+     .select()
+     .from(holdings)
+@@ -13,12 +13,12 @@ export async function getHoldings(): Promise<Holding[]> {
+ }
+ 
+ export async function getAllHoldings(): Promise<Holding[]> {
+-  const userId = await getAuthenticatedUserId()
++  const userId = await getDataUserId()
+   return db.select().from(holdings).where(eq(holdings.user_id, userId))
+ }
+ 
+ export async function getHoldingById(id: string): Promise<Holding | null> {
+-  const userId = await getAuthenticatedUserId()
++  const userId = await getDataUserId()
+   const rows = await db
+     .select()
+     .from(holdings)
+@@ -30,7 +30,7 @@ export async function getHoldingById(id: string): Promise<Holding | null> {
+ export async function createHolding(
+   data: Omit<NewHolding, 'user_id'>
+ ): Promise<Holding> {
+-  const userId = await getAuthenticatedUserId()
++  const userId = await getDataUserId()
+   const rows = await db
+     .insert(holdings)
+     .values({ ...data, user_id: userId })
+@@ -42,7 +42,7 @@ export async function updateHolding(
+   id: string,
+   data: Partial<Omit<NewHolding, 'user_id' | 'id'>>
+ ): Promise<Holding | null> {
+-  const userId = await getAuthenticatedUserId()
++  const userId = await getDataUserId()
+   const rows = await db
+     .update(holdings)
+     .set(data)
+@@ -52,7 +52,7 @@ export async function updateHolding(
+ }
+ 
+ export async function deleteHolding(id: string): Promise<void> {
+-  const userId = await getAuthenticatedUserId()
++  const userId = await getDataUserId()
+   await db
+     .delete(holdings)
+     .where(and(eq(holdings.id, id), eq(holdings.user_id, userId)))
+@@ -66,7 +66,7 @@ export async function getAllActiveHoldingsGlobal(): Promise<Holding[]> {
+ }
+ 
+ export async function updateAlertsEnabled(id: string, enabled: boolean): Promise<Holding | null> {
+-  const userId = await getAuthenticatedUserId()
++  const userId = await getDataUserId()
+   const rows = await db
+     .update(holdings)
+     .set({ alerts_enabled: enabled })
+@@ -76,7 +76,7 @@ export async function updateAlertsEnabled(id: string, enabled: boolean): Promise
+ }
+ 
+ export async function getPortfolioSnapshots(): Promise<PortfolioSnapshot[]> {
+-  const userId = await getAuthenticatedUserId()
++  const userId = await getDataUserId()
+   return db
+     .select()
+     .from(portfolioSnapshots)
+@@ -85,7 +85,7 @@ export async function getPortfolioSnapshots(): Promise<PortfolioSnapshot[]> {
+ }
+ 
+ export async function getTotalRealisedPnL(): Promise<number> {
+-  const userId = await getAuthenticatedUserId()
++  const userId = await getDataUserId()
+   const rows = await db
+     .select({
+       sellPrice: sellLog.sell_price,
+@@ -105,7 +105,7 @@ export async function getExitedHoldings(): Promise<Array<{
+   sellLog: typeof sellLog.$inferSelect
+   holding: Holding
+ }>> {
+-  const userId = await getAuthenticatedUserId()
++  const userId = await getDataUserId()
+   return db
+     .select({
+       sellLog: sellLog,
+diff --git a/src/server/repositories/poolRepository.ts b/src/server/repositories/poolRepository.ts
+index 90c8b40..873fb04 100644
+--- a/src/server/repositories/poolRepository.ts
++++ b/src/server/repositories/poolRepository.ts
+@@ -11,14 +11,14 @@ import {
+   poolNavPublished,
+ } from '@/server/db/schema'
+ import type { PoolAssetType } from '@/utils/poolAssetLabels'
+-import { getAuthenticatedUserId } from '@/server/db/supabase'
++import { getDataUserId } from '@/server/auth/appAccess'
+ import { LIVE_SYNC_FILENAME } from '@/services/pool/poolLiveSync'
+ import type { ParsedTradeRow } from '@/services/pool/holdingReportParser'
+ import type { DailyPoolSnapshot, NavSeriesPoint, StockDaySnapshot } from '@/utils/poolNavCalculator'
+ import { and, asc, desc, eq, gte, inArray, isNotNull, lt } from 'drizzle-orm'
+ 
+ async function resolveUserId(userId?: string): Promise<string> {
+-  return userId ?? getAuthenticatedUserId()
++  return userId ?? getDataUserId()
+ }
+ 
+ export function utcDayBounds(isoDate: string): { start: Date; end: Date } {
+@@ -92,7 +92,7 @@ export async function createPoolAsset(params: {
+   value: number
+   notes?: string
+ }) {
+-  const userId = await getAuthenticatedUserId()
++  const userId = await getDataUserId()
+   const [created] = await db
+     .insert(poolAssets)
+     .values({
+@@ -110,7 +110,7 @@ export async function updatePoolAsset(
+   id: string,
+   params: { name?: string; value?: number; notes?: string | null },
+ ) {
+-  const userId = await getAuthenticatedUserId()
++  const userId = await getDataUserId()
+   const updates: {
+     name?: string
+     value?: string
+@@ -132,7 +132,7 @@ export async function updatePoolAsset(
+ }
+ 
+ export async function deletePoolAsset(id: string) {
+-  const userId = await getAuthenticatedUserId()
++  const userId = await getDataUserId()
+   await db
+     .delete(poolAssets)
+     .where(and(eq(poolAssets.id, id), eq(poolAssets.user_id, userId)))
+@@ -157,7 +157,7 @@ export async function getPoolNavPublished(poolUserId?: string) {
+ }
+ 
+ export async function getPoolDailySnapshots() {
+-  const userId = await getAuthenticatedUserId()
++  const userId = await getDataUserId()
+   return db
+     .select()
+     .from(poolDailySnapshots)
+@@ -166,7 +166,7 @@ export async function getPoolDailySnapshots() {
+ }
+ 
+ export async function getLatestImportBatch() {
+-  const userId = await getAuthenticatedUserId()
++  const userId = await getDataUserId()
+   const rows = await db
+     .select()
+     .from(poolImportBatches)
+@@ -177,7 +177,7 @@ export async function getLatestImportBatch() {
+ }
+ 
+ export async function getLatestLiveSyncBatch() {
+-  const userId = await getAuthenticatedUserId()
++  const userId = await getDataUserId()
+   const rows = await db
+     .select()
+     .from(poolImportBatches)
+@@ -224,7 +224,7 @@ export async function getLatestNavPointBefore(beforeDate: Date, userId?: string)
+ }
+ 
+ export async function clearPoolHistoricalData() {
+-  const userId = await getAuthenticatedUserId()
++  const userId = await getDataUserId()
+ 
+   await db.transaction(async (tx) => {
+     await tx.delete(poolNavPublished).where(eq(poolNavPublished.user_id, userId))
+@@ -357,7 +357,7 @@ export async function syncLivePoolDay(params: {
+ }
+ 
+ export async function getPoolDayDetail(isoDate: string) {
+-  const userId = await getAuthenticatedUserId()
++  const userId = await getDataUserId()
+   const { start, end } = utcDayBounds(isoDate)
+ 
+   const [holdings, trades, publishedNav, draftNav] = await Promise.all([
+@@ -444,7 +444,7 @@ export async function importHoldingReportData(params: {
+   trades: ParsedTradeRow[]
+   parseWarnings: string[]
+ }) {
+-  const userId = await getAuthenticatedUserId()
++  const userId = await getDataUserId()
+   const config = await ensurePoolConfig()
+ 
+   return db.transaction(async (tx) => {
+@@ -535,7 +535,7 @@ export async function importHoldingReportData(params: {
+ }
+ 
+ export async function publishNavDrafts(draftIds?: string[]) {
+-  const userId = await getAuthenticatedUserId()
++  const userId = await getDataUserId()
+ 
+   const drafts = draftIds?.length
+     ? await db
+@@ -601,7 +601,7 @@ export async function publishNavDrafts(draftIds?: string[]) {
+ }
+ 
+ export async function unpublishNavDate(navDate: Date) {
+-  const userId = await getAuthenticatedUserId()
++  const userId = await getDataUserId()
+   await db
+     .delete(poolNavPublished)
+     .where(and(eq(poolNavPublished.user_id, userId), eq(poolNavPublished.nav_date, navDate)))
+@@ -613,7 +613,7 @@ export async function overridePublishedNav(params: {
+   totalAum: number
+   note: string
+ }) {
+-  const userId = await getAuthenticatedUserId()
++  const userId = await getDataUserId()
+   const navDate = new Date(`${params.isoDate}T00:00:00.000Z`)
+   const { start, end } = utcDayBounds(params.isoDate)
+ 
+diff --git a/src/server/repositories/quarterlyRepository.ts b/src/server/repositories/quarterlyRepository.ts
+index c95e015..5401fa4 100644
+--- a/src/server/repositories/quarterlyRepository.ts
++++ b/src/server/repositories/quarterlyRepository.ts
+@@ -5,11 +5,11 @@
+ import { eq, and, desc } from 'drizzle-orm'
+ import { db } from '@/server/db'
+ import { quarterlyUpdates } from '@/server/db/schema'
+-import { getAuthenticatedUserId } from '@/server/db/supabase'
++import { getDataUserId } from '@/server/auth/appAccess'
+ import type { QuarterlyUpdate, NewQuarterlyUpdate } from '@/server/db/schema'
+ 
+ export async function getQuarterlyUpdates(holdingId: string): Promise<QuarterlyUpdate[]> {
+-  const userId = await getAuthenticatedUserId()
++  const userId = await getDataUserId()
+   return db
+     .select()
+     .from(quarterlyUpdates)
+@@ -18,7 +18,7 @@ export async function getQuarterlyUpdates(holdingId: string): Promise<QuarterlyU
+ }
+ 
+ export async function getQuarterlyUpdateById(id: string): Promise<QuarterlyUpdate | null> {
+-  const userId = await getAuthenticatedUserId()
++  const userId = await getDataUserId()
+   const rows = await db
+     .select()
+     .from(quarterlyUpdates)
+@@ -30,7 +30,7 @@ export async function getQuarterlyUpdateById(id: string): Promise<QuarterlyUpdat
+ export async function createQuarterlyUpdate(
+   data: Omit<NewQuarterlyUpdate, 'user_id'>
+ ): Promise<QuarterlyUpdate> {
+-  const userId = await getAuthenticatedUserId()
++  const userId = await getDataUserId()
+   const rows = await db
+     .insert(quarterlyUpdates)
+     .values({ ...data, user_id: userId })
+@@ -42,7 +42,7 @@ export async function updateQuarterlyUpdate(
+   id: string,
+   data: Partial<Omit<NewQuarterlyUpdate, 'user_id' | 'id'>>
+ ): Promise<QuarterlyUpdate | null> {
+-  const userId = await getAuthenticatedUserId()
++  const userId = await getDataUserId()
+   const rows = await db
+     .update(quarterlyUpdates)
+     .set(data)
+@@ -52,7 +52,7 @@ export async function updateQuarterlyUpdate(
+ }
+ 
+ export async function getAllQuarterlyUpdatesUser(): Promise<QuarterlyUpdate[]> {
+-  const userId = await getAuthenticatedUserId()
++  const userId = await getDataUserId()
+   return db
+     .select()
+     .from(quarterlyUpdates)
+@@ -65,7 +65,7 @@ export async function getQuarterlyUpdateForHoldingAndPeriod(
+   quarter: number,
+   year: number
+ ): Promise<QuarterlyUpdate | null> {
+-  const userId = await getAuthenticatedUserId()
++  const userId = await getDataUserId()
+   const rows = await db
+     .select()
+     .from(quarterlyUpdates)
+@@ -82,7 +82,7 @@ export async function getQuarterlyUpdateForHoldingAndPeriod(
+ }
+ 
+ export async function deleteQuarterlyUpdate(id: string): Promise<void> {
+-  const userId = await getAuthenticatedUserId()
++  const userId = await getDataUserId()
+   await db
+     .delete(quarterlyUpdates)
+     .where(and(eq(quarterlyUpdates.id, id), eq(quarterlyUpdates.user_id, userId)))
+diff --git a/src/server/repositories/researchRepository.ts b/src/server/repositories/researchRepository.ts
+index 0a01f87..59e5702 100644
+--- a/src/server/repositories/researchRepository.ts
++++ b/src/server/repositories/researchRepository.ts
+@@ -1,11 +1,11 @@
+ import { eq, and, desc } from 'drizzle-orm'
+ import { db } from '@/server/db'
+ import { researchDocuments } from '@/server/db/schema'
+-import { getAuthenticatedUserId } from '@/server/db/supabase'
++import { getDataUserId } from '@/server/auth/appAccess'
+ import type { ResearchDocument, NewResearchDocument } from '@/server/db/schema'
+ 
+ export async function getResearchDocuments(holdingId: string): Promise<ResearchDocument[]> {
+-  const userId = await getAuthenticatedUserId()
++  const userId = await getDataUserId()
+   return db
+     .select()
+     .from(researchDocuments)
+@@ -16,7 +16,7 @@ export async function getResearchDocuments(holdingId: string): Promise<ResearchD
+ export async function addResearchDocument(
+   data: Omit<NewResearchDocument, 'user_id'>
+ ): Promise<ResearchDocument> {
+-  const userId = await getAuthenticatedUserId()
++  const userId = await getDataUserId()
+   const rows = await db
+     .insert(researchDocuments)
+     .values({ ...data, user_id: userId })
+@@ -25,7 +25,7 @@ export async function addResearchDocument(
+ }
+ 
+ export async function deleteResearchDocument(id: string): Promise<void> {
+-  const userId = await getAuthenticatedUserId()
++  const userId = await getDataUserId()
+   await db
+     .delete(researchDocuments)
+     .where(and(eq(researchDocuments.id, id), eq(researchDocuments.user_id, userId)))
+diff --git a/src/server/repositories/watchlistRepository.ts b/src/server/repositories/watchlistRepository.ts
+index 54f09ab..2766443 100644
+--- a/src/server/repositories/watchlistRepository.ts
++++ b/src/server/repositories/watchlistRepository.ts
+@@ -1,11 +1,11 @@
+ import { eq, and, isNull } from 'drizzle-orm'
+ import { db } from '@/server/db'
+ import { watchlist } from '@/server/db/schema'
+-import { getAuthenticatedUserId } from '@/server/db/supabase'
++import { getDataUserId } from '@/server/auth/appAccess'
+ import type { WatchlistItem, NewWatchlistItem } from '@/server/db/schema'
+ 
+ export async function getWatchlistItems(): Promise<WatchlistItem[]> {
+-  const userId = await getAuthenticatedUserId()
++  const userId = await getDataUserId()
+   return db
+     .select()
+     .from(watchlist)
+@@ -15,7 +15,7 @@ export async function getWatchlistItems(): Promise<WatchlistItem[]> {
+ export async function createWatchlistItem(
+   data: Omit<NewWatchlistItem, 'user_id'>
+ ): Promise<WatchlistItem> {
+-  const userId = await getAuthenticatedUserId()
++  const userId = await getDataUserId()
+   const rows = await db
+     .insert(watchlist)
+     .values({ ...data, user_id: userId })
+@@ -24,7 +24,7 @@ export async function createWatchlistItem(
+ }
+ 
+ export async function deleteWatchlistItem(id: string): Promise<void> {
+-  const userId = await getAuthenticatedUserId()
++  const userId = await getDataUserId()
+   await db
+     .delete(watchlist)
+     .where(and(eq(watchlist.id, id), eq(watchlist.user_id, userId)))
+-- 
+2.43.0
+
+
+From 58fc8be8c6cb135516ffe8cf782a339322b51447 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Sun, 7 Jun 2026 04:28:28 +0000
+Subject: [PATCH 2/2] =?UTF-8?q?feat:=20admin=20Users=20page=20=E2=80=94=20?=
+ =?UTF-8?q?invite=20and=20manage=20view-only=20accounts?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- /admin/users page (admin-only) lists Supabase users with roles
+- Invite, resend invite, and remove users via service role
+- Sidebar Users link and command palette entry for admins
+- ensureUserProfile on login creates view-only user_settings row
+---
+ src/app/(dashboard)/admin/users/page.tsx     |  34 ++++
+ src/app/(dashboard)/layout.tsx               |   3 +-
+ src/components/admin/UsersClient.tsx         | 197 +++++++++++++++++++
+ src/components/layout/CommandPalette.tsx     |  16 +-
+ src/components/layout/Sidebar.tsx            |   2 +
+ src/features/admin/userActions.ts            | 120 +++++++++++
+ src/features/pool/investorActions.ts         |   5 +-
+ src/lib/siteUrl.ts                           |   6 +
+ src/server/auth/appAccess.ts                 |   8 +
+ src/server/repositories/appUserRepository.ts |  48 +++++
+ 10 files changed, 430 insertions(+), 9 deletions(-)
+ create mode 100644 src/app/(dashboard)/admin/users/page.tsx
+ create mode 100644 src/components/admin/UsersClient.tsx
+ create mode 100644 src/features/admin/userActions.ts
+ create mode 100644 src/lib/siteUrl.ts
+ create mode 100644 src/server/repositories/appUserRepository.ts
+
+diff --git a/src/app/(dashboard)/admin/users/page.tsx b/src/app/(dashboard)/admin/users/page.tsx
+new file mode 100644
+index 0000000..af79ca7
+--- /dev/null
++++ b/src/app/(dashboard)/admin/users/page.tsx
+@@ -0,0 +1,34 @@
++import { redirect } from 'next/navigation'
++import { UsersClient } from '@/components/admin/UsersClient'
++import { getIsAdmin } from '@/server/auth/appAccess'
++import { listAppUsers } from '@/server/repositories/appUserRepository'
++import { getAuthenticatedUserId } from '@/server/db/supabase'
++
++export const metadata = { title: 'Users | StockLens Admin' }
++
++export default async function AdminUsersPage() {
++  const isAdmin = await getIsAdmin()
++  if (!isAdmin) redirect('/')
++
++  const [currentUserId, users] = await Promise.all([
++    getAuthenticatedUserId(),
++    listAppUsers().catch(() => []),
++  ])
++
++  return (
++    <div className="space-y-6 animate-fade-in">
++      <div className="page-header">
++        <div className="flex items-center gap-2 mb-1">
++          <span className="badge-pill">Admin</span>
++        </div>
++        <h1 className="page-title">Users</h1>
++        <p className="page-subtitle max-w-2xl mt-2 text-[13px] leading-relaxed">
++          Invite family or collaborators with view-only access. They see the same portfolio and pool data as you
++          but cannot edit holdings, sync broker data, or change settings beyond their own Telegram alerts.
++        </p>
++      </div>
++
++      <UsersClient users={users} currentUserId={currentUserId} />
++    </div>
++  )
++}
+diff --git a/src/app/(dashboard)/layout.tsx b/src/app/(dashboard)/layout.tsx
+index 5b789ac..47d7ae4 100644
+--- a/src/app/(dashboard)/layout.tsx
++++ b/src/app/(dashboard)/layout.tsx
+@@ -7,7 +7,7 @@ import { CommandPalette } from '@/components/layout/CommandPalette'
+ import { AppAccessProvider } from '@/components/layout/AppAccessContext'
+ import { ReadOnlyBanner } from '@/components/layout/ReadOnlyBanner'
+ import { activateInvestorOnLogin } from '@/server/auth/poolAccess'
+-import { ensureAdminOnLogin, getIsAdmin } from '@/server/auth/appAccess'
++import { ensureAdminOnLogin, ensureUserProfile, getIsAdmin } from '@/server/auth/appAccess'
+ import { createSupabaseServerClient } from '@/server/db/supabase'
+ 
+ export default async function DashboardLayout({
+@@ -21,6 +21,7 @@ export default async function DashboardLayout({
+   if (!user) redirect('/login')
+ 
+   await activateInvestorOnLogin(user.id, user.email ?? '')
++  await ensureUserProfile(user.id)
+   await ensureAdminOnLogin(user.id, user.email ?? '')
+   const isAdmin = await getIsAdmin()
+ 
+diff --git a/src/components/admin/UsersClient.tsx b/src/components/admin/UsersClient.tsx
+new file mode 100644
+index 0000000..feed8b1
+--- /dev/null
++++ b/src/components/admin/UsersClient.tsx
+@@ -0,0 +1,197 @@
++'use client'
++
++import { useState, useTransition } from 'react'
++import { useRouter } from 'next/navigation'
++import { toast } from 'sonner'
++import { Loader2, Mail, UserPlus, UserX, RefreshCw, Shield, Eye } from 'lucide-react'
++import {
++  inviteAppUserAction,
++  removeAppUserAction,
++  resendInviteAction,
++} from '@/features/admin/userActions'
++import type { AppUserRow } from '@/server/repositories/appUserRepository'
++
++interface Props {
++  users: AppUserRow[]
++  currentUserId: string
++}
++
++function formatWhen(iso: string | null): string {
++  if (!iso) return '—'
++  return new Date(iso).toLocaleString('en-IN', {
++    day: 'numeric',
++    month: 'short',
++    year: '2-digit',
++    hour: '2-digit',
++    minute: '2-digit',
++  })
++}
++
++export function UsersClient({ users, currentUserId }: Props) {
++  const router = useRouter()
++  const [isPending, startTransition] = useTransition()
++  const [email, setEmail] = useState('')
++
++  function handleInvite() {
++    startTransition(async () => {
++      const result = await inviteAppUserAction(email)
++      if (!result.success) {
++        toast.error(result.error ?? 'Invite failed')
++        return
++      }
++      toast.success(`Invite sent to ${email.trim()}`)
++      setEmail('')
++      router.refresh()
++    })
++  }
++
++  function handleResend(targetEmail: string) {
++    startTransition(async () => {
++      const result = await resendInviteAction(targetEmail)
++      if (!result.success) {
++        toast.error(result.error ?? 'Resend failed')
++        return
++      }
++      toast.success(`Invite resent to ${targetEmail}`)
++      router.refresh()
++    })
++  }
++
++  function handleRemove(user: AppUserRow) {
++    if (!window.confirm(`Remove ${user.email}? They will lose access immediately.`)) return
++
++    startTransition(async () => {
++      const result = await removeAppUserAction(user.id)
++      if (!result.success) {
++        toast.error(result.error ?? 'Remove failed')
++        return
++      }
++      toast.success(`${user.email} removed`)
++      router.refresh()
++    })
++  }
++
++  return (
++    <div className="space-y-6 max-w-3xl">
++      <div className="card rounded-xl p-5 border border-[#1c212a] bg-[#0b0e14]">
++        <div className="flex items-center gap-2 mb-2">
++          <UserPlus size={16} className="text-[#60a5fa]" />
++          <h2 className="text-sm font-semibold text-[#f1f5f9]">Invite user</h2>
++        </div>
++        <p className="text-xs text-[#64748b] mb-4 leading-relaxed">
++          Sends a Supabase invite email. New users get <strong className="text-[#94a3b8]">view-only</strong> access
++          to the full app (same screens as you, no edits).
++        </p>
++        <div className="flex flex-col sm:flex-row gap-2">
++          <input
++            type="email"
++            value={email}
++            onChange={(e) => setEmail(e.target.value)}
++            placeholder="family@example.com"
++            className="flex-1 bg-[#070a0d] border border-[#1c212a] rounded-lg px-3 py-2 text-sm text-[#e2e8f0]"
++          />
++          <button
++            type="button"
++            onClick={handleInvite}
++            disabled={isPending || !email.trim()}
++            className="btn-primary py-2 px-4 text-sm justify-center shrink-0"
++          >
++            {isPending ? <Loader2 size={14} className="animate-spin" /> : <Mail size={14} />}
++            Send invite
++          </button>
++        </div>
++      </div>
++
++      <div className="card rounded-xl border border-[#1c212a] bg-[#0b0e14] overflow-hidden">
++        <div className="px-5 py-3 border-b border-[#1c212a]">
++          <h2 className="text-sm font-semibold text-[#f1f5f9]">
++            Users ({users.length})
++          </h2>
++        </div>
++
++        {users.length === 0 ? (
++          <p className="px-5 py-8 text-sm text-[#64748b] text-center">No users yet.</p>
++        ) : (
++          <div className="divide-y divide-[#1c212a]/60">
++            {users.map((user) => {
++              const isSelf = user.id === currentUserId
++              const status = user.emailConfirmed
++                ? user.lastSignInAt
++                  ? 'Active'
++                  : 'Confirmed'
++                : 'Invite pending'
++
++              return (
++                <div
++                  key={user.id}
++                  className="px-5 py-3 flex flex-col sm:flex-row sm:items-center gap-3 justify-between"
++                >
++                  <div className="min-w-0">
++                    <div className="flex items-center gap-2 flex-wrap">
++                      <span className="text-sm font-medium text-[#e2e8f0] truncate">{user.email}</span>
++                      {isSelf && (
++                        <span className="text-[9px] uppercase font-bold px-1.5 py-0.5 rounded bg-[#3b82f6]/15 text-[#60a5fa]">
++                          You
++                        </span>
++                      )}
++                      <span
++                        className={`inline-flex items-center gap-1 text-[9px] uppercase font-bold px-1.5 py-0.5 rounded ${
++                          user.isAdmin
++                            ? 'bg-[#22c55e]/15 text-[#22c55e]'
++                            : 'bg-[#64748b]/15 text-[#94a3b8]'
++                        }`}
++                      >
++                        {user.isAdmin ? <Shield size={10} /> : <Eye size={10} />}
++                        {user.isAdmin ? 'Admin' : 'View only'}
++                      </span>
++                      <span
++                        className={`text-[9px] uppercase font-bold px-1.5 py-0.5 rounded ${
++                          status === 'Active'
++                            ? 'bg-[#22c55e]/10 text-[#22c55e]'
++                            : status === 'Invite pending'
++                              ? 'bg-[#f59e0b]/10 text-[#fbbf24]'
++                              : 'bg-[#3b82f6]/10 text-[#60a5fa]'
++                        }`}
++                      >
++                        {status}
++                      </span>
++                    </div>
++                    <p className="text-[10px] text-[#64748b] mt-1 font-mono">
++                      Joined {formatWhen(user.createdAt)}
++                      {user.lastSignInAt ? ` · Last sign-in ${formatWhen(user.lastSignInAt)}` : ''}
++                    </p>
++                  </div>
++
++                  {!isSelf && (
++                    <div className="flex items-center gap-2 shrink-0">
++                      {!user.emailConfirmed && (
++                        <button
++                          type="button"
++                          disabled={isPending}
++                          onClick={() => handleResend(user.email)}
++                          className="px-2.5 py-1.5 rounded border border-[#1c212a] text-[10px] text-[#94a3b8] hover:text-[#e2e8f0] flex items-center gap-1"
++                        >
++                          <RefreshCw size={11} />
++                          Resend
++                        </button>
++                      )}
++                      <button
++                        type="button"
++                        disabled={isPending}
++                        onClick={() => handleRemove(user)}
++                        className="px-2.5 py-1.5 rounded border border-[#ef4444]/30 text-[10px] text-[#ef4444] hover:bg-[#ef4444]/10 flex items-center gap-1"
++                      >
++                        <UserX size={11} />
++                        Remove
++                      </button>
++                    </div>
++                  )}
++                </div>
++              )
++            })}
++          </div>
++        )}
++      </div>
++    </div>
++  )
++}
+diff --git a/src/components/layout/CommandPalette.tsx b/src/components/layout/CommandPalette.tsx
+index f30134f..c547c54 100644
+--- a/src/components/layout/CommandPalette.tsx
++++ b/src/components/layout/CommandPalette.tsx
+@@ -7,7 +7,7 @@ import { useAppAccess } from '@/components/layout/AppAccessContext'
+ import { COMMAND_ITEMS } from '@/lib/navigation'
+ 
+ export function CommandPalette() {
+-  const { isReadOnly } = useAppAccess()
++  const { isReadOnly, isAdmin } = useAppAccess()
+   const [isOpen, setIsOpen] = useState(false)
+   const [search, setSearch] = useState('')
+   const [activeIndex, setActiveIndex] = useState(0)
+@@ -15,9 +15,17 @@ export function CommandPalette() {
+   const overlayRef = useRef<HTMLDivElement>(null)
+   const inputRef = useRef<HTMLInputElement>(null)
+ 
+-  const commands = isReadOnly
+-    ? COMMAND_ITEMS.filter((cmd) => cmd.category === 'Navigation')
+-    : COMMAND_ITEMS
++  const commands = [
++    ...(isReadOnly ? COMMAND_ITEMS.filter((cmd) => cmd.category === 'Navigation') : COMMAND_ITEMS),
++    ...(isAdmin
++      ? [{
++          label: 'Users (Admin)',
++          description: 'Invite and manage view-only app users.',
++          category: 'Navigation' as const,
++          href: '/admin/users',
++        }]
++      : []),
++  ]
+ 
+   useEffect(() => {
+     const handleKeyDown = (e: KeyboardEvent) => {
+diff --git a/src/components/layout/Sidebar.tsx b/src/components/layout/Sidebar.tsx
+index 1c2d31e..7d10ddd 100644
+--- a/src/components/layout/Sidebar.tsx
++++ b/src/components/layout/Sidebar.tsx
+@@ -2,6 +2,7 @@
+ 
+ import Link from 'next/link'
+ import { usePathname } from 'next/navigation'
++import { Users } from 'lucide-react'
+ import { ADMIN_NAV } from '@/lib/navigation'
+ 
+ interface SidebarProps {
+@@ -70,6 +71,7 @@ export function Sidebar({ userEmail = 'karthik@stocklens.com', isAdmin = false }
+             System
+           </div>
+           <div className="space-y-0.5">
++            {isAdmin && renderLink('/admin/users', 'Users', 'Invite and manage view-only app users', Users)}
+             {renderLink(settingsItem.href, settingsItem.label, settingsItem.description, settingsItem.icon)}
+           </div>
+         </div>
+diff --git a/src/features/admin/userActions.ts b/src/features/admin/userActions.ts
+new file mode 100644
+index 0000000..f6b58c1
+--- /dev/null
++++ b/src/features/admin/userActions.ts
+@@ -0,0 +1,120 @@
++'use server'
++
++import { revalidatePath } from 'next/cache'
++import { writeAudit } from '@/lib/audit'
++import { siteUrl } from '@/lib/siteUrl'
++import { isUserAdmin, requireAdmin } from '@/server/auth/appAccess'
++import {
++  countAdmins,
++  deleteUserSettings,
++  listAppUsers,
++} from '@/server/repositories/appUserRepository'
++import { createSupabaseServiceClient, getAuthenticatedUserId } from '@/server/db/supabase'
++
++export async function getAppUsersAction(): Promise<{
++  success: boolean
++  users?: Awaited<ReturnType<typeof listAppUsers>>
++  error?: string
++}> {
++  try {
++    await requireAdmin()
++    const users = await listAppUsers()
++    return { success: true, users }
++  } catch (err) {
++    return { success: false, error: err instanceof Error ? err.message : 'Failed to load users' }
++  }
++}
++
++export async function inviteAppUserAction(
++  email: string,
++): Promise<{ success: boolean; error?: string }> {
++  try {
++    await requireAdmin()
++
++    const normalized = email.trim().toLowerCase()
++    if (!normalized || !normalized.includes('@')) {
++      return { success: false, error: 'Valid email is required' }
++    }
++
++    const existing = await listAppUsers()
++    if (existing.some((u) => u.email.toLowerCase() === normalized)) {
++      return { success: false, error: 'A user with this email already exists' }
++    }
++
++    const supabase = createSupabaseServiceClient()
++    const { error } = await supabase.auth.admin.inviteUserByEmail(normalized, {
++      redirectTo: `${siteUrl()}/auth/callback`,
++    })
++
++    if (error) {
++      return { success: false, error: error.message }
++    }
++
++    const actor = await getAuthenticatedUserId()
++    await writeAudit('manual_action', `Invited user ${normalized}`, { email: normalized }, actor)
++
++    revalidatePath('/admin/users')
++    return { success: true }
++  } catch (err) {
++    return { success: false, error: err instanceof Error ? err.message : 'Invite failed' }
++  }
++}
++
++export async function resendInviteAction(
++  email: string,
++): Promise<{ success: boolean; error?: string }> {
++  try {
++    await requireAdmin()
++
++    const normalized = email.trim().toLowerCase()
++    const supabase = createSupabaseServiceClient()
++    const { error } = await supabase.auth.admin.inviteUserByEmail(normalized, {
++      redirectTo: `${siteUrl()}/auth/callback`,
++    })
++
++    if (error) {
++      return { success: false, error: error.message }
++    }
++
++    revalidatePath('/admin/users')
++    return { success: true }
++  } catch (err) {
++    return { success: false, error: err instanceof Error ? err.message : 'Resend failed' }
++  }
++}
++
++export async function removeAppUserAction(
++  userId: string,
++): Promise<{ success: boolean; error?: string }> {
++  try {
++    await requireAdmin()
++
++    const currentId = await getAuthenticatedUserId()
++    if (userId === currentId) {
++      return { success: false, error: 'You cannot remove your own account' }
++    }
++
++    if (await isUserAdmin(userId)) {
++      const admins = await countAdmins()
++      if (admins <= 1) {
++        return { success: false, error: 'Cannot remove the only admin account' }
++      }
++    }
++
++    const supabase = createSupabaseServiceClient()
++    const { error } = await supabase.auth.admin.deleteUser(userId)
++    if (error) {
++      return { success: false, error: error.message }
++    }
++
++    await deleteUserSettings(userId)
++
++    const actor = await getAuthenticatedUserId()
++    await writeAudit('manual_action', `Removed user ${userId}`, { userId }, actor)
++
++    revalidatePath('/admin/users')
++    return { success: true }
++  } catch (err) {
++    return { success: false, error: err instanceof Error ? err.message : 'Remove failed' }
++  }
++}
+diff --git a/src/features/pool/investorActions.ts b/src/features/pool/investorActions.ts
+index f4a6d54..178e242 100644
+--- a/src/features/pool/investorActions.ts
++++ b/src/features/pool/investorActions.ts
+@@ -13,10 +13,7 @@ import {
+   voidPoolInvestorTransaction,
+ } from '@/server/repositories/poolInvestorRepository'
+ 
+-function siteUrl(): string {
+-  const domain = process.env.RAILWAY_PUBLIC_DOMAIN
+-  return domain ? `https://${domain}` : process.env.NEXT_PUBLIC_SITE_URL ?? 'http://localhost:3000'
+-}
++import { siteUrl } from '@/lib/siteUrl'
+ 
+ export async function invitePoolInvestorAction(
+   email: string,
+diff --git a/src/lib/siteUrl.ts b/src/lib/siteUrl.ts
+new file mode 100644
+index 0000000..0771ae0
+--- /dev/null
++++ b/src/lib/siteUrl.ts
+@@ -0,0 +1,6 @@
++/** Canonical app URL for auth redirects and invite emails. */
++export function siteUrl(): string {
++  const domain = process.env.RAILWAY_PUBLIC_DOMAIN
++  if (domain) return `https://${domain}`
++  return process.env.NEXT_PUBLIC_SITE_URL ?? 'http://localhost:3000'
++}
+diff --git a/src/server/auth/appAccess.ts b/src/server/auth/appAccess.ts
+index c4ce606..71fb947 100644
+--- a/src/server/auth/appAccess.ts
++++ b/src/server/auth/appAccess.ts
+@@ -69,3 +69,11 @@ export async function ensureAdminOnLogin(userId: string, email: string): Promise
+ export function isPublicSignupAllowed(): boolean {
+   return process.env.ALLOW_PUBLIC_SIGNUP === 'true'
+ }
++
++/** Ensure every signed-in user has a user_settings row (view-only by default). */
++export async function ensureUserProfile(userId: string): Promise<void> {
++  await db
++    .insert(userSettings)
++    .values({ user_id: userId, is_admin: false })
++    .onConflictDoNothing()
++}
+diff --git a/src/server/repositories/appUserRepository.ts b/src/server/repositories/appUserRepository.ts
+new file mode 100644
+index 0000000..94baf44
+--- /dev/null
++++ b/src/server/repositories/appUserRepository.ts
+@@ -0,0 +1,48 @@
++import 'server-only'
++
++import { eq } from 'drizzle-orm'
++import { db } from '@/server/db'
++import { userSettings } from '@/server/db/schema'
++import { createSupabaseServiceClient } from '@/server/db/supabase'
++
++export interface AppUserRow {
++  id: string
++  email: string
++  isAdmin: boolean
++  createdAt: string
++  lastSignInAt: string | null
++  emailConfirmed: boolean
++}
++
++export async function listAppUsers(): Promise<AppUserRow[]> {
++  const supabase = createSupabaseServiceClient()
++  const { data, error } = await supabase.auth.admin.listUsers({ page: 1, perPage: 200 })
++  if (error) throw new Error(error.message)
++
++  const settings = await db.select().from(userSettings)
++  const adminByUser = new Map(settings.map((s) => [s.user_id, s.is_admin]))
++
++  return (data.users ?? [])
++    .filter((u) => u.email)
++    .map((u) => ({
++      id:               u.id,
++      email:            u.email!,
++      isAdmin:          adminByUser.get(u.id) ?? false,
++      createdAt:        u.created_at,
++      lastSignInAt:     u.last_sign_in_at ?? null,
++      emailConfirmed:   Boolean(u.email_confirmed_at),
++    }))
++    .sort((a, b) => a.email.localeCompare(b.email))
++}
++
++export async function countAdmins(): Promise<number> {
++  const rows = await db
++    .select({ id: userSettings.id })
++    .from(userSettings)
++    .where(eq(userSettings.is_admin, true))
++  return rows.length
++}
++
++export async function deleteUserSettings(userId: string): Promise<void> {
++  await db.delete(userSettings).where(eq(userSettings.user_id, userId))
++}
+-- 
+2.43.0
+
