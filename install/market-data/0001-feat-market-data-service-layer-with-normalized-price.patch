@@ -1,7 +1,7 @@
 From 326410bc335b19e48ecfa055e42d5250a20c7f5a Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Sun, 7 Jun 2026 03:45:50 +0000
-Subject: [PATCH] feat: market data service layer with normalized prices
+Subject: [PATCH 1/2] feat: market data service layer with normalized prices
 
 Add instruments, normalized_prices, and normalized_corporate_actions
 tables. Route all price queries through marketDataService with provider
@@ -1034,6 +1034,667 @@ index 0000000..af3bbad
 +  NormalizedCorporateAction,
 +  'action_type' | 'ex_date' | 'ratio_numerator' | 'ratio_denominator' | 'old_symbol' | 'new_symbol'
 +>
+-- 
+2.43.0
+
+
+From 5490b46aae1431b17a3757cae618fee8f1125689 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Sun, 7 Jun 2026 03:51:26 +0000
+Subject: [PATCH 2/2] feat: NSE/BSE live providers and corporate action
+ auto-ingest
+
+- Add exchangeHttp helpers with NSE cookie warmup
+- Implement live NSE quote-equity + bhavcopy fallback
+- Implement BSE getScripHeaderData provider
+- Add corporate action ingest/sync from NSE API
+- Add corporate-actions-sync cron route and workflow
+- Run corp sync alongside market-data-sync cron
+---
+ .github/workflows/corporate-actions-sync.yml  |  18 +++
+ .../api/cron/corporate-actions-sync/route.ts  |  18 +++
+ src/app/api/cron/market-data-sync/route.ts    |  10 +-
+ .../repositories/marketDataRepository.ts      |   8 +-
+ .../marketData/corporateActionIngest.test.ts  |  29 +++++
+ .../marketData/corporateActionIngest.ts       | 107 ++++++++++++++++
+ .../marketData/corporateActionSync.ts         |  97 ++++++++++++++
+ src/services/marketData/exchangeHttp.ts       |  86 +++++++++++++
+ .../marketData/providers/bseProvider.ts       |  40 +++++-
+ .../marketData/providers/nseProvider.ts       | 118 +++++++++++++++++-
+ 10 files changed, 517 insertions(+), 14 deletions(-)
+ create mode 100644 .github/workflows/corporate-actions-sync.yml
+ create mode 100644 src/app/api/cron/corporate-actions-sync/route.ts
+ create mode 100644 src/services/marketData/corporateActionIngest.test.ts
+ create mode 100644 src/services/marketData/corporateActionIngest.ts
+ create mode 100644 src/services/marketData/corporateActionSync.ts
+ create mode 100644 src/services/marketData/exchangeHttp.ts
+
+diff --git a/.github/workflows/corporate-actions-sync.yml b/.github/workflows/corporate-actions-sync.yml
+new file mode 100644
+index 0000000..f85abcf
+--- /dev/null
++++ b/.github/workflows/corporate-actions-sync.yml
+@@ -0,0 +1,18 @@
++name: Corporate Actions Sync
++
++on:
++  schedule:
++    # Daily 18:00 IST (12:30 UTC) after market close
++    - cron: '30 12 * * 1-5'
++  workflow_dispatch:
++
++jobs:
++  sync:
++    runs-on: ubuntu-latest
++    timeout-minutes: 10
++    steps:
++      - name: Sync NSE corporate actions
++        run: |
++          curl -sf -X GET \
++            -H "X-Cron-Secret: ${{ secrets.CRON_SECRET }}" \
++            "${{ secrets.RAILWAY_APP_URL }}/api/cron/corporate-actions-sync"
+diff --git a/src/app/api/cron/corporate-actions-sync/route.ts b/src/app/api/cron/corporate-actions-sync/route.ts
+new file mode 100644
+index 0000000..9928303
+--- /dev/null
++++ b/src/app/api/cron/corporate-actions-sync/route.ts
+@@ -0,0 +1,18 @@
++import { NextResponse, type NextRequest } from 'next/server'
++import { env } from '@/lib/env'
++import { syncCorporateActions } from '@/services/marketData/corporateActionSync'
++
++export async function GET(request: NextRequest) {
++  const cronSecretHeader = request.headers.get('x-cron-secret')
++  if (!cronSecretHeader || cronSecretHeader !== env.CRON_SECRET) {
++    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
++  }
++
++  try {
++    const result = await syncCorporateActions()
++    return NextResponse.json({ success: true, ...result })
++  } catch (error) {
++    console.error('[cron-corporate-actions-sync]', error)
++    return NextResponse.json({ error: 'Internal Server Error' }, { status: 500 })
++  }
++}
+diff --git a/src/app/api/cron/market-data-sync/route.ts b/src/app/api/cron/market-data-sync/route.ts
+index 9080ead..7ab92dc 100644
+--- a/src/app/api/cron/market-data-sync/route.ts
++++ b/src/app/api/cron/market-data-sync/route.ts
+@@ -4,6 +4,7 @@ import { db } from '@/server/db'
+ import { holdings } from '@/server/db/schema'
+ import { eq } from 'drizzle-orm'
+ import { syncMarketDataForTickers } from '@/services/marketData/marketDataService'
++import { syncCorporateActions } from '@/services/marketData/corporateActionSync'
+ 
+ const rateLimitMap = new Map<string, { count: number; windowStart: number }>()
+ 
+@@ -43,11 +44,18 @@ export async function GET(request: NextRequest) {
+       .where(eq(holdings.status, 'active'))
+ 
+     const tickers = Array.from(new Set(rows.map((r) => r.ticker)))
+-    const result = await syncMarketDataForTickers(tickers)
++    const [result, corp] = await Promise.all([
++      syncMarketDataForTickers(tickers),
++      syncCorporateActions({ lookbackDays: 7, forwardDays: 30 }).catch((err) => {
++        console.warn('[cron-market-data-sync] corp actions sync failed:', err)
++        return { fetched: 0, upserted: 0, symbolChanges: 0 }
++      }),
++    ])
+ 
+     return NextResponse.json({
+       tickers: tickers.length,
+       ...result,
++      corporate_actions: corp,
+     })
+   } catch (error) {
+     console.error('[cron-market-data-sync]', error)
+diff --git a/src/server/repositories/marketDataRepository.ts b/src/server/repositories/marketDataRepository.ts
+index 039e2d6..4cebdf8 100644
+--- a/src/server/repositories/marketDataRepository.ts
++++ b/src/server/repositories/marketDataRepository.ts
+@@ -69,5 +69,11 @@ export async function upsertCorporateAction(
+   await db
+     .insert(normalizedCorporateActions)
+     .values(data)
+-    .onConflictDoNothing()
++    .onConflictDoNothing({
++      target: [
++        normalizedCorporateActions.instrument_id,
++        normalizedCorporateActions.action_type,
++        normalizedCorporateActions.ex_date,
++      ],
++    })
+ }
+diff --git a/src/services/marketData/corporateActionIngest.test.ts b/src/services/marketData/corporateActionIngest.test.ts
+new file mode 100644
+index 0000000..399263a
+--- /dev/null
++++ b/src/services/marketData/corporateActionIngest.test.ts
+@@ -0,0 +1,29 @@
++import { describe, expect, it } from 'vitest'
++import { classifyCorporateSubject, parseNseCorporateActions, parseRatio } from './corporateActionIngest'
++
++describe('parseRatio', () => {
++  it('parses 1:2 from bonus text', () => {
++    expect(parseRatio('Bonus 1:2')).toEqual({ ratio_numerator: 1, ratio_denominator: 2 })
++  })
++})
++
++describe('classifyCorporateSubject', () => {
++  it('detects split', () => {
++    expect(classifyCorporateSubject('Stock Split from Rs 10 to Rs 5').action_type).toBe('split')
++  })
++  it('detects bonus', () => {
++    expect(classifyCorporateSubject('Bonus 1:1').action_type).toBe('bonus')
++  })
++})
++
++describe('parseNseCorporateActions', () => {
++  it('parses NSE JSON array', () => {
++    const out = parseNseCorporateActions([
++      { symbol: 'RELIANCE', subject: 'Bonus 1:1', exDate: '15-Jan-2024' },
++    ])
++    expect(out).toHaveLength(1)
++    expect(out[0]!.symbol).toBe('RELIANCE')
++    expect(out[0]!.action_type).toBe('bonus')
++    expect(out[0]!.ex_date).toBe('2024-01-15')
++  })
++})
+diff --git a/src/services/marketData/corporateActionIngest.ts b/src/services/marketData/corporateActionIngest.ts
+new file mode 100644
+index 0000000..4f97e0a
+--- /dev/null
++++ b/src/services/marketData/corporateActionIngest.ts
+@@ -0,0 +1,107 @@
++import type { NewNormalizedCorporateAction } from '@/server/db/schema'
++
++export interface ParsedCorporateAction {
++  symbol: string
++  action_type: NewNormalizedCorporateAction['action_type']
++  ex_date: string
++  ratio_numerator?: number
++  ratio_denominator?: number
++  old_symbol?: string
++  new_symbol?: string
++  notes?: string
++  source: string
++  payload_json?: Record<string, unknown>
++}
++
++/** Classify NSE/BSE subject line into action type + ratio. */
++export function classifyCorporateSubject(subject: string): {
++  action_type: ParsedCorporateAction['action_type']
++  ratio_numerator?: number
++  ratio_denominator?: number
++} {
++  const s = subject.toLowerCase()
++
++  if (s.includes('stock split') || s.includes('sub-division') || s.includes('subdivision')) {
++    const ratio = parseRatio(subject)
++    return { action_type: 'split', ...ratio }
++  }
++  if (s.includes('bonus')) {
++    const ratio = parseRatio(subject)
++    return { action_type: 'bonus', ...ratio }
++  }
++  if (s.includes('rights')) {
++    const ratio = parseRatio(subject)
++    return { action_type: 'rights', ...ratio }
++  }
++  if (s.includes('dividend')) {
++    return { action_type: 'dividend' }
++  }
++  if (s.includes('delist')) {
++    return { action_type: 'delisting' }
++  }
++  if (s.includes('merger') || s.includes('amalgamation')) {
++    return { action_type: 'merger' }
++  }
++  if (s.includes('name change') || s.includes('symbol change')) {
++    return { action_type: 'symbol_change' }
++  }
++  return { action_type: 'dividend' }
++}
++
++/** Parse "Bonus 1:1", "Split from Rs 10 to Rs 5", "1:2" patterns. */
++export function parseRatio(text: string): { ratio_numerator?: number; ratio_denominator?: number } {
++  const m = text.match(/(\d+)\s*:\s*(\d+)/)
++  if (!m) return {}
++  return {
++    ratio_numerator: Number(m[1]),
++    ratio_denominator: Number(m[2]),
++  }
++}
++
++export function parseNseCorporateActions(payload: unknown): ParsedCorporateAction[] {
++  const rows = Array.isArray(payload)
++    ? payload
++    : (payload as { data?: unknown[] })?.data ?? []
++
++  const out: ParsedCorporateAction[] = []
++
++  for (const row of rows) {
++    if (!row || typeof row !== 'object') continue
++    const r = row as Record<string, unknown>
++    const symbol = String(r.symbol ?? r.SYMBOL ?? '').trim().toUpperCase()
++    const subject = String(r.subject ?? r.SUBJECT ?? r.purpose ?? r.PURPOSE ?? '').trim()
++    const exRaw = String(r.exDate ?? r.EX_DATE ?? r.exdate ?? '')
++    const ex_date = normalizeExDate(exRaw)
++    if (!symbol || !ex_date) continue
++
++    const { action_type, ratio_numerator, ratio_denominator } = classifyCorporateSubject(subject)
++
++    out.push({
++      symbol,
++      action_type,
++      ex_date,
++      ratio_numerator,
++      ratio_denominator,
++      notes: subject,
++      source: 'nse',
++      payload_json: r,
++    })
++  }
++
++  return out
++}
++
++function normalizeExDate(raw: string): string | null {
++  if (!raw) return null
++  const iso = /^\d{4}-\d{2}-\d{2}$/.test(raw)
++  if (iso) return raw
++  const m = raw.match(/^(\d{1,2})-([A-Za-z]{3})-(\d{4})$/)
++  if (!m) return null
++  const months: Record<string, string> = {
++    Jan: '01', Feb: '02', Mar: '03', Apr: '04', May: '05', Jun: '06',
++    Jul: '07', Aug: '08', Sep: '09', Oct: '10', Nov: '11', Dec: '12',
++  }
++  const mon = months[m[2]!]
++  if (!mon) return null
++  return `${m[3]}-${mon}-${m[1]!.padStart(2, '0')}`
++}
+diff --git a/src/services/marketData/corporateActionSync.ts b/src/services/marketData/corporateActionSync.ts
+new file mode 100644
+index 0000000..abcc57b
+--- /dev/null
++++ b/src/services/marketData/corporateActionSync.ts
+@@ -0,0 +1,97 @@
++/**
++ * Phase 3 — sync corporate actions from NSE into normalized_corporate_actions.
++ */
++
++import { db } from '@/server/db'
++import { instruments } from '@/server/db/schema'
++import { eq } from 'drizzle-orm'
++import { nseFetch, parseNseDate } from './exchangeHttp'
++import { parseNseCorporateActions } from './corporateActionIngest'
++import { ensureInstrument } from '@/server/repositories/instrumentRepository'
++import { upsertCorporateAction } from '@/server/repositories/marketDataRepository'
++
++function formatNseDate(d: Date): string {
++  const dd = String(d.getDate()).padStart(2, '0')
++  const mm = String(d.getMonth() + 1).padStart(2, '0')
++  const yyyy = d.getFullYear()
++  return `${dd}-${mm}-${yyyy}`
++}
++
++export async function fetchNseCorporateActions(
++  fromDate: Date,
++  toDate: Date,
++): Promise<ReturnType<typeof parseNseCorporateActions>> {
++  const res = await nseFetch(
++    '/api/corporates-corporateActions',
++    {
++      index: 'equities',
++      from_date: formatNseDate(fromDate),
++      to_date: formatNseDate(toDate),
++    },
++    'https://www.nseindia.com/companies-listing/corporate-filings-actions',
++  )
++
++  if (!res.ok) {
++    console.warn(`[corp-sync] NSE corporate actions HTTP ${res.status}`)
++    return []
++  }
++
++  const json = await res.json()
++  return parseNseCorporateActions(json)
++}
++
++export async function syncCorporateActions(options?: {
++  lookbackDays?: number
++  forwardDays?: number
++}): Promise<{ fetched: number; upserted: number; symbolChanges: number }> {
++  const lookback = options?.lookbackDays ?? 30
++  const forward = options?.forwardDays ?? 90
++
++  const toDate = new Date()
++  const fromDate = new Date()
++  fromDate.setDate(fromDate.getDate() - lookback)
++  toDate.setDate(toDate.getDate() + forward)
++
++  const parsed = await fetchNseCorporateActions(fromDate, toDate)
++  let upserted = 0
++  let symbolChanges = 0
++
++  for (const action of parsed) {
++    const instrument = await ensureInstrument(`${action.symbol}-EQ`, action.symbol)
++    const exDate = parseNseDate(action.ex_date) ?? action.ex_date
++
++    await upsertCorporateAction({
++      instrument_id: instrument.id,
++      action_type: action.action_type,
++      ex_date: exDate,
++      ratio_numerator: action.ratio_numerator != null ? String(action.ratio_numerator) : null,
++      ratio_denominator: action.ratio_denominator != null ? String(action.ratio_denominator) : null,
++      old_symbol: action.old_symbol ?? null,
++      new_symbol: action.new_symbol ?? null,
++      source: action.source,
++      notes: action.notes ?? null,
++      payload_json: action.payload_json ?? null,
++    })
++    upserted++
++
++    if (action.action_type === 'symbol_change' && action.new_symbol) {
++      await db
++        .update(instruments)
++        .set({
++          status: 'symbol_changed',
++          updated_at: new Date(),
++        })
++        .where(eq(instruments.id, instrument.id))
++      symbolChanges++
++    }
++
++    if (action.action_type === 'delisting') {
++      await db
++        .update(instruments)
++        .set({ status: 'delisted', updated_at: new Date() })
++        .where(eq(instruments.id, instrument.id))
++    }
++  }
++
++  return { fetched: parsed.length, upserted, symbolChanges }
++}
+diff --git a/src/services/marketData/exchangeHttp.ts b/src/services/marketData/exchangeHttp.ts
+new file mode 100644
+index 0000000..cfc8a4e
+--- /dev/null
++++ b/src/services/marketData/exchangeHttp.ts
+@@ -0,0 +1,86 @@
++/** Shared HTTP helpers for NSE / BSE public APIs (cookie warmup + browser headers). */
++
++const USER_AGENTS = [
++  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
++  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
++]
++
++function pickUserAgent(): string {
++  return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)]!
++}
++
++export function nseHeaders(referer = 'https://www.nseindia.com/'): HeadersInit {
++  return {
++    'User-Agent': pickUserAgent(),
++    Referer: referer,
++    Accept: '*/*',
++    'Accept-Language': 'en-US,en;q=0.9',
++    'X-Requested-With': 'XMLHttpRequest',
++  }
++}
++
++export function bseHeaders(): HeadersInit {
++  return {
++    'User-Agent': pickUserAgent(),
++    Referer: 'https://www.bseindia.com/',
++    Accept: 'application/json, text/plain, */*',
++    'Accept-Language': 'en-US,en;q=0.9',
++  }
++}
++
++let nseCookieJar = ''
++
++async function warmNseSession(referer: string): Promise<void> {
++  const res = await fetch(referer, {
++    headers: nseHeaders(referer),
++    signal: AbortSignal.timeout(12_000),
++  })
++  const setCookie = res.headers.getSetCookie?.() ?? []
++  if (setCookie.length > 0) {
++    nseCookieJar = setCookie.map((c) => c.split(';')[0]).join('; ')
++  }
++}
++
++export async function nseFetch(
++  path: string,
++  params?: Record<string, string>,
++  referer = 'https://www.nseindia.com/',
++): Promise<Response> {
++  await warmNseSession(referer)
++  const url = new URL(path, 'https://www.nseindia.com')
++  if (params) {
++    for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v)
++  }
++  return fetch(url.toString(), {
++    headers: {
++      ...nseHeaders(referer),
++      ...(nseCookieJar ? { Cookie: nseCookieJar } : {}),
++    },
++    signal: AbortSignal.timeout(15_000),
++  })
++}
++
++export async function bseFetch(path: string): Promise<Response> {
++  const url = path.startsWith('http') ? path : `https://api.bseindia.com${path}`
++  return fetch(url, {
++    headers: bseHeaders(),
++    signal: AbortSignal.timeout(12_000),
++  })
++}
++
++/** Parse NSE date strings: "15-Jan-2024" or "15-01-2024" → YYYY-MM-DD */
++export function parseNseDate(raw: string | undefined | null): string | null {
++  if (!raw?.trim()) return null
++  const s = raw.trim()
++  const iso = /^\d{4}-\d{2}-\d{2}$/.test(s)
++  if (iso) return s
++  const m = s.match(/^(\d{1,2})-([A-Za-z]{3})-(\d{4})$/)
++  if (!m) return null
++  const months: Record<string, string> = {
++    Jan: '01', Feb: '02', Mar: '03', Apr: '04', May: '05', Jun: '06',
++    Jul: '07', Aug: '08', Sep: '09', Oct: '10', Nov: '11', Dec: '12',
++  }
++  const mon = months[m[2]!]
++  if (!mon) return null
++  return `${m[3]}-${mon}-${m[1]!.padStart(2, '0')}`
++}
+diff --git a/src/services/marketData/providers/bseProvider.ts b/src/services/marketData/providers/bseProvider.ts
+index c1e104c..70818b8 100644
+--- a/src/services/marketData/providers/bseProvider.ts
++++ b/src/services/marketData/providers/bseProvider.ts
+@@ -1,15 +1,43 @@
+ import type { Instrument } from '@/server/db/schema'
+ import type { MarketDataProvider, RawQuote } from '../types'
++import { bseFetch } from '../exchangeHttp'
++
++interface BseHeaderData {
++  CurrRate?: number | string
++  PrevClose?: number | string
++  scripnm?: string
++}
+ 
+-/**
+- * BSE quote provider — Phase 1 stub.
+- * Phase 2: wire BSE getScripHeaderData (packages/scanner/market.py).
+- */
+ export const bseProvider: MarketDataProvider = {
+   name: 'bse',
+   priority: 25,
+ 
+-  async getQuote(_instrument: Instrument): Promise<RawQuote | null> {
+-    return null
++  async getQuote(instrument: Instrument): Promise<RawQuote | null> {
++    const scrip = instrument.bse_scrip_code
++    if (!scrip) return null
++
++    try {
++      const res = await bseFetch(
++        `/BseIndiaAPI/api/getScripHeaderData/w?Scrip_cd=${encodeURIComponent(scrip)}`,
++      )
++      if (!res.ok) return null
++
++      const data = (await res.json()) as BseHeaderData
++      const price = Number(data.CurrRate ?? 0)
++      const prev = Number(data.PrevClose ?? 0)
++      if (!price || price <= 0) return null
++
++      const change_pct = prev > 0 ? ((price - prev) / prev) * 100 : 0
++
++      return {
++        price,
++        change_pct: Math.round(change_pct * 100) / 100,
++        source: 'bse',
++        as_of: new Date(),
++        fetched_at: new Date(),
++      }
++    } catch {
++      return null
++    }
+   },
+ }
+diff --git a/src/services/marketData/providers/nseProvider.ts b/src/services/marketData/providers/nseProvider.ts
+index 5bbf30e..6de0473 100644
+--- a/src/services/marketData/providers/nseProvider.ts
++++ b/src/services/marketData/providers/nseProvider.ts
+@@ -1,15 +1,121 @@
+ import type { Instrument } from '@/server/db/schema'
+ import type { MarketDataProvider, RawQuote } from '../types'
++import { nseFetch } from '../exchangeHttp'
++
++interface NseQuoteEquity {
++  priceInfo?: {
++    lastPrice?: number
++    pChange?: number
++    previousClose?: number
++    intraDayHighLow?: { max?: number; min?: number }
++  }
++  metadata?: { lastUpdateTime?: string }
++}
++
++async function fetchLiveQuote(symbol: string): Promise<RawQuote | null> {
++  const res = await nseFetch(
++    '/api/quote-equity',
++    { symbol },
++    'https://www.nseindia.com/get-quotes/equity',
++  )
++  if (!res.ok) return null
++
++  const data = (await res.json()) as NseQuoteEquity
++  const price = Number(data.priceInfo?.lastPrice ?? 0)
++  if (!price || price <= 0) return null
++
++  const change_pct = Number(data.priceInfo?.pChange ?? 0)
++  const as_of = data.metadata?.lastUpdateTime
++    ? new Date(data.metadata.lastUpdateTime)
++    : new Date()
++
++  return {
++    price,
++    change_pct,
++    source: 'nse',
++    as_of,
++    fetched_at: new Date(),
++  }
++}
++
++/** EOD bhavcopy close — fallback when live quote unavailable (post 17:30 IST). */
++async function fetchBhavcopyClose(symbol: string): Promise<RawQuote | null> {
++  const now = new Date()
++  for (let daysBack = 0; daysBack < 8; daysBack++) {
++    const d = new Date(now)
++    d.setUTCDate(d.getUTCDate() - daysBack)
++    if (d.getUTCDay() === 0 || d.getUTCDay() === 6) continue
++
++    const dd = String(d.getUTCDate()).padStart(2, '0')
++    const mm = String(d.getUTCMonth() + 1).padStart(2, '0')
++    const yyyy = d.getUTCFullYear()
++    const dateStr = `${dd}${mm}${yyyy}`
++
++    const urls = [
++      `https://nsearchives.nseindia.com/products/content/sec_bhavdata_full_${dateStr}.csv`,
++      `https://archives.nseindia.com/products/content/sec_bhavdata_full_${dateStr}.csv`,
++    ]
++
++    for (const url of urls) {
++      try {
++        const res = await fetch(url, {
++          headers: { 'User-Agent': 'Mozilla/5.0 StockLens/1.0' },
++          signal: AbortSignal.timeout(20_000),
++        })
++        if (!res.ok || res.headers.get('content-length') === '0') continue
++        const text = await res.text()
++        if (text.length < 500) continue
++
++        const close = parseBhavcopyRow(text, symbol)
++        if (close && close > 0) {
++          const as_of = new Date(`${yyyy}-${mm}-${dd}T10:00:00Z`)
++          return {
++            price: close,
++            change_pct: 0,
++            source: 'nse',
++            as_of,
++            fetched_at: new Date(),
++          }
++        }
++      } catch {
++        continue
++      }
++    }
++  }
++  return null
++}
++
++function parseBhavcopyRow(csv: string, symbol: string): number | null {
++  const lines = csv.split('\n')
++  if (lines.length < 2) return null
++  const header = lines[0]!.split(',').map((h) => h.trim().replace(/"/g, ''))
++  const symIdx = header.indexOf('SYMBOL')
++  const seriesIdx = header.indexOf('SERIES')
++  const closeIdx = header.indexOf('CLOSE_PRICE')
++  if (symIdx < 0 || closeIdx < 0) return null
++
++  const target = symbol.toUpperCase()
++  for (let i = 1; i < lines.length; i++) {
++    const cols = lines[i]!.split(',').map((c) => c.trim().replace(/"/g, ''))
++    if (cols[symIdx]?.toUpperCase() !== target) continue
++    if (seriesIdx >= 0 && cols[seriesIdx] !== 'EQ') continue
++    const close = parseFloat(cols[closeIdx] ?? '0')
++    if (close > 0) return close
++  }
++  return null
++}
+ 
+-/**
+- * NSE official quote provider — Phase 1 stub.
+- * Phase 2: wire NSE bhavcopy / quote API (same data as packages/scanner/market.py).
+- */
+ export const nseProvider: MarketDataProvider = {
+   name: 'nse',
+   priority: 20,
+ 
+-  async getQuote(_instrument: Instrument): Promise<RawQuote | null> {
+-    return null
++  async getQuote(instrument: Instrument): Promise<RawQuote | null> {
++    if (instrument.exchange === 'BSE' && !instrument.canonical_symbol) return null
++
++    const symbol = instrument.canonical_symbol
++    const live = await fetchLiveQuote(symbol).catch(() => null)
++    if (live) return live
++
++    return fetchBhavcopyClose(symbol).catch(() => null)
+   },
+ }
 -- 
 2.43.0
 

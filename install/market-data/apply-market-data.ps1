@@ -20,7 +20,7 @@ if ($LASTEXITCODE -ne 0) {
     git am --abort 2>$null
     git apply --3way $Patch.FullName
     git add -A
-    git commit -m 'feat: market data service layer with normalized prices'
+    git commit -m 'feat: market data service layer with NSE/BSE providers and corp action sync'
 }
 
 git log master..HEAD --oneline
